@@ -1,0 +1,147 @@
+Complete Endpoint List
+
+Library
+GET    /assessments
+       Query params: status (all|live|scheduled|draft|ended)
+                     subject_code
+                     section_id
+       Returns: array of assessment summaries with status, title,
+                description, source info, recipients, question count,
+                duration, submission counts, avg score, window times
+
+DELETE /assessments/:assmt_id
+       Soft-deletes the assessment (moves to trash)
+
+Empty State
+No dedicated endpoints. Covered entirely by GET /assessments returning an empty array.
+
+New Assessment (Compose — blank)
+GET    /subjects
+       Returns: subject → unit → topic tree for the source picker
+                (topic mode) and for library filtering
+
+GET    /sections
+       Query params: role (faculty|hod|principal)
+       Returns: sections scoped to the caller's role, grouped by subject
+
+GET    /semesters
+       Query params: role, department_code (optional, Principal only)
+       Returns: semester list with student counts
+                (HOD and Principal only — hidden for faculty role)
+
+GET    /departments
+       Returns: department list with student counts
+                (Principal only)
+
+GET    /students
+       Query params: role, section_id (optional), q (name/roll search)
+       Returns: students scoped to caller's role, grouped by section
+
+POST   /assessments/documents
+       Body: multipart file upload (PDF)
+       Returns: { document_id, name, size, pages }
+
+POST   /assessments
+       Body: { title, description, source_kind, document_id?,
+               topic_ids[], subject_code?, recipients[],
+               question_count, duration_minutes,
+               start_time, end_time,
+               rubric: { relevance, blooms, depth },
+               status: 'draft' | 'scheduled' | 'live' }
+       Returns: created assessment object with assmt_id
+
+Edit Assessment (Compose — pre-filled)
+GET    /subjects                       (same as New Assessment)
+GET    /sections                       (same as New Assessment)
+GET    /semesters                      (same as New Assessment)
+GET    /departments                    (same as New Assessment)
+GET    /students                       (same as New Assessment)
+
+POST   /assessments/documents          (same as New Assessment,
+                                        if attachment is changed)
+
+PATCH  /assessments/:assmt_id
+       Body: same shape as POST /assessments (partial update allowed)
+             status transitions: draft→draft, draft→scheduled,
+                                 draft→live, scheduled→live
+       Returns: updated assessment object
+
+Monitor (Live view)
+GET    /assessments/:assmt_id/stats
+       Poll interval: ~10s
+       Returns: { submitted_count, writing_count, not_started_count,
+                  avg_score, closes_in, window_label }
+
+GET    /assessments/:assmt_id/roster
+       Query params: status (all|submitted|writing|not-started)
+                     sort (score-desc|score-asc|name-asc|name-desc|time-asc)
+       Returns: array of students with status, question count,
+                submission time, score
+
+GET    /assessments/:assmt_id/students/:student_id/questions
+       Returns: array of { question_number, question_text,
+                           r_score, b_score, d_score,
+                           composite_score, ai_feedback }
+
+GET    /assessments/:assmt_id/document
+       Returns: { url, name, pages }
+                (document mode only — opens Reading drawer)
+
+GET    /assessments/:assmt_id/topics
+       Returns: topics grouped by unit with code and label
+                (topic mode only — opens Topics drawer)
+
+POST   /assessments/:assmt_id/students/:student_id/feedback
+       Body: { message }
+       Returns: { sent_at }
+
+PATCH  /assessments/:assmt_id/end
+       No body required
+       Transitions status: live → ended
+       Returns: ended assessment object with computed result fields
+
+Ended (Results view)
+GET    /assessments/:assmt_id/overview
+       Returns: { submitted_count, missed_count, questions_asked,
+                  avg_score, avg_score_pct, top_score_pct,
+                  median_time, score_distribution[],
+                  by_dimension: { relevance, blooms, depth } }
+
+GET    /assessments/:assmt_id/top-questions
+       Returns: array of { question_id, prompt, relevance, bloom,
+                           depth, avg_score, similar_count }
+
+GET    /assessments/:assmt_id/students
+       Query params: status (all|submitted|absent)
+                     score_band (e.g. "8-9", "7-8")
+                     sort (score-desc|score-asc|name-asc|name-desc|roll-asc)
+       Returns: array of students with score, dimension averages,
+                submission time, question count
+
+GET    /assessments/:assmt_id/students/:student_id/questions
+       (Same endpoint as Monitor — reused for the review drawer)
+
+GET    /assessments/:assmt_id/questions/:question_id/similar
+       Returns: array of { student_id, student_name, roll,
+                           section_label, phrasing, q_score }
+
+POST   /assessments/:assmt_id/students/:student_id/feedback
+       (Same endpoint as Monitor — reused for post-hoc feedback)
+
+GET    /assessments/:assmt_id/document
+       (Same as Monitor — for the Reading drawer)
+
+GET    /assessments/:assmt_id/topics
+       (Same as Monitor — for the Topics drawer)
+
+GET    /assessments/:assmt_id/export
+       Query params: format (csv|xlsx|pdf), columns[] 
+       Returns: file download (Content-Disposition: attachment)
+
+POST   /assessments/:assmt_id/share
+       Body: { scope: 'faculty'|'department'|'hod'|'college',
+               emails: string[] }
+       Returns: { share_url, scope, notified_count }
+
+Summary — Full Endpoint Count
+GroupEndpointsLibrary2Compose (shared across New + Edit)7Monitor7Ended10Total26
