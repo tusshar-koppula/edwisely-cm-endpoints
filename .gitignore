@@ -46,3 +46,11 @@ logs/
 # Distribution / packaging
 *.tar.gz
 *.zip
+
+#Misc
+Complete_Endpoint_List.txt
+Comprehensive faculty design_Curiosity Assessment Included.html
+sampleCodeForEndpoints.py
+sampleCodeForQuery.py
+sample_data.sql
+supporting_tables.sql
