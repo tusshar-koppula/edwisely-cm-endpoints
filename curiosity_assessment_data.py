@@ -47,9 +47,146 @@ def _closes_in_label(end_time):
     return _format_duration(total_seconds)
 
 
+# ------------------------------------------------------------
+# HELPER — 3-tier access check for assessment-scoped operations
+#   principal → blanket access
+#   hod       → own assessments OR assessments whose sections
+#               fall within the HOD's department
+#   faculty   → own assessments only
+# ------------------------------------------------------------
+def _checkAccess(user_id, assmt_id, db, metadata, created_by=None):
+    college_account_new                      = metadata.tables['college_account_new']
+    college_university_degree_department_new = metadata.tables['college_university_degree_department_new']
+    university_degree_department_new         = metadata.tables['university_degree_department_new']
+    department_new                           = metadata.tables['department_new']
+    ca_has_sections                          = metadata.tables['ca_has_sections']
+    college_department_section_new           = metadata.tables['college_department_section_new']
+
+    user = db.execute(
+        select(college_account_new.c.role)
+        .where(college_account_new.c.id == user_id)
+    ).mappings().first()
+
+    if not user:
+        return False
+
+    role = user['role']
+
+    if role == 'principal':
+        return True
+
+    if created_by is None:
+        curiosity_assessment = metadata.tables['curiosity_assessment']
+        assmt_row = db.execute(
+            select(curiosity_assessment.c.created_by)
+            .where(curiosity_assessment.c.assmt_id == assmt_id)
+        ).mappings().first()
+        if not assmt_row:
+            return False
+        created_by = assmt_row['created_by']
+
+    if role == 'faculty':
+        return created_by == user_id
+
+    if role == 'hod':
+        if created_by == user_id:
+            return True
+
+        # Check if any of the assessment's sections fall in the HOD's department
+        dept_row = db.execute(
+            select(department_new.c.id.label('department_id'))
+            .select_from(
+                college_account_new
+                .join(college_university_degree_department_new,
+                    college_university_degree_department_new.c.id
+                    == college_account_new.c.college_university_degree_department_id)
+                .join(university_degree_department_new,
+                    university_degree_department_new.c.id
+                    == college_university_degree_department_new.c.university_degree_department_id)
+                .join(department_new,
+                    department_new.c.id == university_degree_department_new.c.department_id)
+            )
+            .where(college_account_new.c.id == user_id)
+        ).mappings().first()
+
+        if not dept_row:
+            return False
+
+        match = db.execute(
+            select(ca_has_sections.c.section_id)
+            .select_from(
+                ca_has_sections
+                .join(college_department_section_new,
+                    college_department_section_new.c.id == ca_has_sections.c.section_id)
+            )
+            .where(
+                and_(
+                    ca_has_sections.c.ca_id == assmt_id,
+                    college_department_section_new.c.department_id == dept_row['department_id']
+                )
+            )
+        ).mappings().first()
+
+        return match is not None
+
+    return False
+
+
 # ============================================================
 # LIBRARY
 # ============================================================
+
+def getAssessmentFilters(user_id, db, metadata):
+    curiosity_assessment           = metadata.tables['curiosity_assessment']
+    ca_has_sections                = metadata.tables['ca_has_sections']
+    college_department_section_new = metadata.tables['college_department_section_new']
+
+    subject_rows = db.execute(
+        select(curiosity_assessment.c.subject_code)
+        .where(
+            and_(
+                curiosity_assessment.c.created_by == user_id,
+                curiosity_assessment.c.is_deleted == 0,
+                curiosity_assessment.c.subject_code.isnot(None)
+            )
+        )
+        .distinct()
+        .order_by(curiosity_assessment.c.subject_code)
+    ).mappings().all()
+
+    section_rows = db.execute(
+        select(
+            college_department_section_new.c.id.label('section_id'),
+            college_department_section_new.c.section_name
+        )
+        .select_from(
+            ca_has_sections
+            .join(curiosity_assessment,
+                curiosity_assessment.c.assmt_id == ca_has_sections.c.ca_id)
+            .join(college_department_section_new,
+                college_department_section_new.c.id == ca_has_sections.c.section_id)
+        )
+        .where(
+            and_(
+                curiosity_assessment.c.created_by == user_id,
+                curiosity_assessment.c.is_deleted == 0
+            )
+        )
+        .distinct()
+        .order_by(college_department_section_new.c.section_name)
+    ).mappings().all()
+
+    return OrderedDict([
+        ('subjects', [{'subject_code': r['subject_code']} for r in subject_rows]),
+        ('sections', [
+            OrderedDict([
+                ('section_id',   r['section_id']),
+                ('section_name', r['section_name'])
+            ])
+            for r in section_rows
+        ])
+    ])
+
 
 def getAssessments(user_id, db, metadata, status=None, subject_code=None, section_id=None):
     curiosity_assessment    = metadata.tables['curiosity_assessment']
@@ -113,7 +250,10 @@ def getAssessments(user_id, db, metadata, status=None, subject_code=None, sectio
 
     rows = db.execute(query).mappings().all()
     if not rows:
-        return []
+        return OrderedDict([
+            ('assessments', []),
+            ('filters',     getAssessmentFilters(user_id, db, metadata))
+        ])
 
     # Fetch section ids for each assessment in one query
     section_query = (
@@ -165,19 +305,23 @@ def getAssessments(user_id, db, metadata, status=None, subject_code=None, sectio
         assessments.append(entry)
 
     assessments.sort(key=lambda x: sort_order.get(x['status'], 9))
-    return assessments
+    return OrderedDict([
+        ('assessments', assessments),
+        ('filters',     getAssessmentFilters(user_id, db, metadata))
+    ])
 
 
 def deleteAssessment(user_id, db, metadata, assmt_id):
     curiosity_assessment = metadata.tables['curiosity_assessment']
 
-    # Verify ownership before soft-deleting
+    if not _checkAccess(user_id, assmt_id, db, metadata):
+        return None
+
     check = db.execute(
         select(curiosity_assessment.c.assmt_id)
         .where(
             and_(
                 curiosity_assessment.c.assmt_id == assmt_id,
-                curiosity_assessment.c.created_by == user_id,
                 curiosity_assessment.c.is_deleted == 0
             )
         )
@@ -195,6 +339,103 @@ def deleteAssessment(user_id, db, metadata, assmt_id):
     return {'assmt_id': assmt_id}
 
 
+def duplicateAssessment(user_id, db, metadata, assmt_id):
+    curiosity_assessment = metadata.tables['curiosity_assessment']
+    ca_has_topics        = metadata.tables['ca_has_topics']
+    ca_has_sections      = metadata.tables['ca_has_sections']
+    ca_has_students      = metadata.tables['ca_has_students']
+
+    if not _checkAccess(user_id, assmt_id, db, metadata):
+        return None
+
+    src = db.execute(
+        select(curiosity_assessment)
+        .where(
+            and_(
+                curiosity_assessment.c.assmt_id == assmt_id,
+                curiosity_assessment.c.is_deleted == 0
+            )
+        )
+    ).mappings().first()
+
+    if not src:
+        return None
+
+    now = _utcnow()
+
+    try:
+        result = db.execute(
+            curiosity_assessment.insert().values(
+                created_by       = user_id,
+                topic_source     = src['topic_source'],
+                assmt_title      = src['assmt_title'] + ' (Copy)',
+                assmt_brief      = src['assmt_brief'],
+                question_count   = src['question_count'],
+                duration_minutes = src['duration_minutes'],
+                subject_code     = src['subject_code'],
+                document_id      = src['document_id'],
+                rubric_relevance = src['rubric_relevance'],
+                rubric_blooms    = src['rubric_blooms'],
+                rubric_depth     = src['rubric_depth'],
+                status           = 'draft',
+                start_time       = None,
+                end_time         = None,
+                is_deleted       = 0,
+                created_at       = now,
+                updated_at       = now
+            )
+        )
+        new_id = result.lastrowid
+
+        # Copy topics
+        topic_rows = db.execute(
+            select(ca_has_topics.c.topic_id)
+            .where(ca_has_topics.c.ca_id == assmt_id)
+        ).mappings().all()
+        if topic_rows:
+            db.execute(
+                ca_has_topics.insert(),
+                [{'ca_id': new_id, 'topic_id': r['topic_id']} for r in topic_rows]
+            )
+
+        # Copy sections
+        section_rows = db.execute(
+            select(ca_has_sections.c.section_id)
+            .where(ca_has_sections.c.ca_id == assmt_id)
+        ).mappings().all()
+        if section_rows:
+            db.execute(
+                ca_has_sections.insert(),
+                [{'ca_id': new_id, 'section_id': r['section_id']} for r in section_rows]
+            )
+
+        # Copy audience — student statuses reset to not_started for the new draft
+        student_rows = db.execute(
+            select(ca_has_students.c.student_id)
+            .where(ca_has_students.c.ca_id == assmt_id)
+        ).mappings().all()
+        if student_rows:
+            db.execute(
+                ca_has_students.insert(),
+                [
+                    {
+                        'ca_id':      new_id,
+                        'student_id': r['student_id'],
+                        'status':     'not_started',
+                        'added_at':   now
+                    }
+                    for r in student_rows
+                ]
+            )
+
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    return _fetchAssessmentById(new_id, db, metadata)
+
+
 # ============================================================
 # COMPOSE — shared across New Assessment and Edit Assessment
 # ============================================================
@@ -206,15 +447,12 @@ def getSubjects(user_id, db, metadata):
     college_subject_mapping = metadata.tables['college_subject_mapping']
     subject_semester_new    = metadata.tables['subject_semester_new']
     subject_master          = metadata.tables['subject_master']
-    topics                  = metadata.tables['topics']  # units in this system
 
     query = (
         select(
             subject_master.c.id.label('subject_master_id'),
             subject_master.c.name.label('subject_name'),
             college_subject_mapping.c.subject_code,
-            topics.c.id.label('unit_id'),
-            topics.c.name.label('unit_name'),
             subject_semester_new.c.id.label('subject_semester_id')
         )
         .select_from(
@@ -229,8 +467,6 @@ def getSubjects(user_id, db, metadata):
                 subject_semester_new.c.id == college_subject_mapping.c.subject_semester_id)
             .join(subject_master,
                 subject_master.c.id == subject_semester_new.c.subject_master_id)
-            .join(topics,
-                topics.c.subject_semester_id == college_subject_mapping.c.subject_semester_id)
         )
         .where(
             and_(
@@ -245,25 +481,73 @@ def getSubjects(user_id, db, metadata):
     if not rows:
         return None
 
-    # Build subject → units tree
-    subjects_dict = OrderedDict()
+    seen = set()
+    subjects = []
     for row in rows:
-        subj_id = row['subject_master_id']
-        if subj_id not in subjects_dict:
-            subjects_dict[subj_id] = {
-                'subject_master_id':  subj_id,
-                'subject_name':       row['subject_name'],
-                'subject_code':       row['subject_code'],
-                'units': []
-            }
-        unit_ids = [u['unit_id'] for u in subjects_dict[subj_id]['units']]
-        if row['unit_id'] not in unit_ids:
-            subjects_dict[subj_id]['units'].append({
-                'unit_id':   row['unit_id'],
-                'unit_name': row['unit_name']
-            })
+        sid = row['subject_master_id']
+        if sid not in seen:
+            seen.add(sid)
+            subjects.append(OrderedDict([
+                ('subject_master_id',   sid),
+                ('subject_name',        row['subject_name']),
+                ('subject_code',        row['subject_code']),
+                ('subject_semester_id', row['subject_semester_id'])
+            ]))
 
-    return list(subjects_dict.values())
+    return subjects
+
+
+def getTopics(user_id, db, metadata, subject_code):
+    college_account_new    = metadata.tables['college_account_new']
+    college_account_subject_college_department_section_new = metadata.tables[
+        'college_account_subject_college_department_section_new']
+    college_subject_mapping = metadata.tables['college_subject_mapping']
+    subject_semester_new    = metadata.tables['subject_semester_new']
+    topics                  = metadata.tables['topics']
+
+    query = (
+        select(
+            topics.c.id.label('unit_id'),
+            topics.c.name.label('unit_name')
+        )
+        .select_from(
+            college_account_new
+            .join(college_account_subject_college_department_section_new,
+                college_account_subject_college_department_section_new.c.college_account_id
+                == college_account_new.c.id)
+            .join(college_subject_mapping,
+                college_subject_mapping.c.id
+                == college_account_subject_college_department_section_new.c.college_subject_mapping_id)
+            .join(subject_semester_new,
+                subject_semester_new.c.id == college_subject_mapping.c.subject_semester_id)
+            .join(topics,
+                topics.c.subject_semester_id == college_subject_mapping.c.subject_semester_id)
+        )
+        .where(
+            and_(
+                college_account_new.c.id == user_id,
+                college_account_subject_college_department_section_new.c.inactive == 0,
+                college_subject_mapping.c.subject_code == subject_code
+            )
+        )
+        .distinct()
+        .order_by(topics.c.id)
+    )
+
+    rows = db.execute(query).mappings().all()
+    if not rows:
+        return None
+
+    return OrderedDict([
+        ('subject_code', subject_code),
+        ('units', [
+            OrderedDict([
+                ('unit_id',   row['unit_id']),
+                ('unit_name', row['unit_name'])
+            ])
+            for row in rows
+        ])
+    ])
 
 
 def getSections(user_id, db, metadata, role):
@@ -769,12 +1053,11 @@ def updateAssessment(user_id, db, metadata, assmt_id,
     ca_has_students         = metadata.tables['ca_has_students']
     student_section_mapping = metadata.tables['student_section_mapping']
 
-    # Fetch current record — verify ownership
+    if not _checkAccess(user_id, assmt_id, db, metadata):
+        return None
+
     current = db.execute(
-        select(
-            curiosity_assessment.c.status,
-            curiosity_assessment.c.created_by
-        )
+        select(curiosity_assessment.c.status)
         .where(
             and_(
                 curiosity_assessment.c.assmt_id == assmt_id,
@@ -783,7 +1066,7 @@ def updateAssessment(user_id, db, metadata, assmt_id,
         )
     ).mappings().first()
 
-    if not current or current['created_by'] != user_id:
+    if not current:
         return None
 
     current_status = current['status']
@@ -961,18 +1244,19 @@ def getAssessmentStats(user_id, db, metadata, assmt_id):
     ca_has_students         = metadata.tables['ca_has_students']
     ca_question_submissions = metadata.tables['ca_question_submissions']
 
-    # Verify ownership
+    if not _checkAccess(user_id, assmt_id, db, metadata):
+        return None
+
     assmt = db.execute(
         select(
             curiosity_assessment.c.end_time,
             curiosity_assessment.c.start_time,
-            curiosity_assessment.c.status,
-            curiosity_assessment.c.created_by
+            curiosity_assessment.c.status
         )
         .where(curiosity_assessment.c.assmt_id == assmt_id)
     ).mappings().first()
 
-    if not assmt or assmt['created_by'] != user_id:
+    if not assmt:
         return None
 
     # Aggregate student statuses
@@ -1023,16 +1307,8 @@ def getAssessmentRoster(user_id, db, metadata, assmt_id, status=None, sort=None)
     ca_question_submissions = metadata.tables['ca_question_submissions']
     college_account_new     = metadata.tables['college_account_new']
 
-    # Verify ownership
-    assmt = db.execute(
-        select(curiosity_assessment.c.created_by, curiosity_assessment.c.question_count)
-        .where(curiosity_assessment.c.assmt_id == assmt_id)
-    ).mappings().first()
-
-    if not assmt or assmt['created_by'] != user_id:
+    if not _checkAccess(user_id, assmt_id, db, metadata):
         return None
-
-    total_questions = assmt['question_count']
 
     query = (
         select(
@@ -1042,7 +1318,8 @@ def getAssessmentRoster(user_id, db, metadata, assmt_id, status=None, sort=None)
             college_account_new.c.name.label('student_name'),
             college_account_new.c.roll_number.label('roll'),
             func.count(distinct(ca_question_submissions.c.q_id)).label('q_count'),
-            func.avg(ca_question_submissions.c.composite_score).label('avg_score')
+            func.avg(ca_question_submissions.c.composite_score).label('avg_score'),
+            curiosity_assessment.c.question_count
         )
         .select_from(
             ca_has_students
@@ -1053,23 +1330,24 @@ def getAssessmentRoster(user_id, db, metadata, assmt_id, status=None, sort=None)
                     ca_question_submissions.c.ca_id == ca_has_students.c.ca_id,
                     ca_question_submissions.c.student_id == ca_has_students.c.student_id
                 ))
+            .join(curiosity_assessment,
+                curiosity_assessment.c.assmt_id == ca_has_students.c.ca_id)
         )
         .where(ca_has_students.c.ca_id == assmt_id)
         .group_by(
             ca_has_students.c.student_id,
             ca_has_students.c.status,
             ca_has_students.c.submitted_at,
-            college_account_new.c.id
+            college_account_new.c.id,
+            curiosity_assessment.c.question_count
         )
     )
 
     if status and status != 'all':
-        # Map URL param to DB enum value
         status_map = {'not-started': 'not_started'}
         db_status = status_map.get(status, status)
         query = query.where(ca_has_students.c.status == db_status)
 
-    # Apply sort
     sort_map = {
         'score-desc': func.avg(ca_question_submissions.c.composite_score).desc(),
         'score-asc':  func.avg(ca_question_submissions.c.composite_score).asc(),
@@ -1086,6 +1364,7 @@ def getAssessmentRoster(user_id, db, metadata, assmt_id, status=None, sort=None)
 
     roster = []
     for row in rows:
+        total_questions = row['question_count']
         score = round(float(row['avg_score']) * total_questions / 10, 2) \
             if row['avg_score'] else None
         roster.append(OrderedDict([
@@ -1107,13 +1386,12 @@ def getStudentQuestions(user_id, db, metadata, assmt_id, student_id):
     ca_question_submissions = metadata.tables['ca_question_submissions']
     ca_faculty_feedback     = metadata.tables['ca_faculty_feedback']
 
-    # Verify ownership of the assessment
     assmt = db.execute(
-        select(curiosity_assessment.c.created_by)
+        select(curiosity_assessment.c.assmt_id, curiosity_assessment.c.created_by)
         .where(curiosity_assessment.c.assmt_id == assmt_id)
     ).mappings().first()
 
-    if not assmt or assmt['created_by'] != user_id:
+    if not assmt or not _checkAccess(user_id, assmt_id, db, metadata, created_by=assmt['created_by']):
         return None
 
     # Fetch submitted questions ordered by question_number
@@ -1184,9 +1462,12 @@ def getStudentQuestions(user_id, db, metadata, assmt_id, student_id):
     ])
 
 
-def getAssessmentDocument(user_id, db, metadata, assmt_id):
+def getAssessmentDocument(user_id, db, metadata, assmt_id, created_by=None):
     curiosity_assessment = metadata.tables['curiosity_assessment']
     ca_documents         = metadata.tables['ca_documents']
+
+    if not _checkAccess(user_id, assmt_id, db, metadata, created_by=created_by):
+        return None
 
     row = db.execute(
         select(
@@ -1201,12 +1482,7 @@ def getAssessmentDocument(user_id, db, metadata, assmt_id):
             .join(ca_documents,
                 ca_documents.c.doc_id == curiosity_assessment.c.document_id)
         )
-        .where(
-            and_(
-                curiosity_assessment.c.assmt_id == assmt_id,
-                curiosity_assessment.c.created_by == user_id
-            )
-        )
+        .where(curiosity_assessment.c.assmt_id == assmt_id)
     ).mappings().first()
 
     if not row:
@@ -1221,20 +1497,22 @@ def getAssessmentDocument(user_id, db, metadata, assmt_id):
     ])
 
 
-def getAssessmentTopics(user_id, db, metadata, assmt_id):
+def getAssessmentTopics(user_id, db, metadata, assmt_id, created_by=None):
     curiosity_assessment = metadata.tables['curiosity_assessment']
     ca_has_topics        = metadata.tables['ca_has_topics']
     topics               = metadata.tables['topics']           # unit table
     subject_semester_new = metadata.tables['subject_semester_new']
     subject_master       = metadata.tables['subject_master']
 
-    # Verify ownership
+    if not _checkAccess(user_id, assmt_id, db, metadata, created_by=created_by):
+        return None
+
     assmt = db.execute(
-        select(curiosity_assessment.c.created_by, curiosity_assessment.c.subject_code)
+        select(curiosity_assessment.c.subject_code)
         .where(curiosity_assessment.c.assmt_id == assmt_id)
     ).mappings().first()
 
-    if not assmt or assmt['created_by'] != user_id:
+    if not assmt:
         return None
 
     rows = db.execute(
@@ -1279,17 +1557,36 @@ def getAssessmentTopics(user_id, db, metadata, assmt_id):
     ])
 
 
+def getAssessmentSyllabus(user_id, db, metadata, assmt_id):
+    curiosity_assessment = metadata.tables['curiosity_assessment']
+
+    assmt = db.execute(
+        select(
+            curiosity_assessment.c.assmt_id,
+            curiosity_assessment.c.topic_source,
+            curiosity_assessment.c.created_by
+        )
+        .where(curiosity_assessment.c.assmt_id == assmt_id)
+    ).mappings().first()
+
+    if not assmt or not _checkAccess(user_id, assmt_id, db, metadata, created_by=assmt['created_by']):
+        return None
+
+    if assmt['topic_source'] == 'document':
+        return getAssessmentDocument(user_id, db, metadata, assmt_id, created_by=assmt['created_by'])
+    return getAssessmentTopics(user_id, db, metadata, assmt_id, created_by=assmt['created_by'])
+
+
 def sendStudentFeedback(user_id, db, metadata, assmt_id, student_id, message_text):
     curiosity_assessment = metadata.tables['curiosity_assessment']
     ca_faculty_feedback  = metadata.tables['ca_faculty_feedback']
 
-    # Verify ownership
     assmt = db.execute(
-        select(curiosity_assessment.c.created_by)
+        select(curiosity_assessment.c.assmt_id, curiosity_assessment.c.created_by)
         .where(curiosity_assessment.c.assmt_id == assmt_id)
     ).mappings().first()
 
-    if not assmt or assmt['created_by'] != user_id:
+    if not assmt or not _checkAccess(user_id, assmt_id, db, metadata, created_by=assmt['created_by']):
         return None
 
     sent_at = _utcnow()
@@ -1313,16 +1610,15 @@ def sendStudentFeedback(user_id, db, metadata, assmt_id, student_id, message_tex
 def endAssessment(user_id, db, metadata, assmt_id):
     curiosity_assessment = metadata.tables['curiosity_assessment']
 
+    if not _checkAccess(user_id, assmt_id, db, metadata):
+        return None
+
     assmt = db.execute(
-        select(curiosity_assessment.c.status, curiosity_assessment.c.created_by)
+        select(curiosity_assessment.c.status)
         .where(curiosity_assessment.c.assmt_id == assmt_id)
     ).mappings().first()
 
-    if not assmt:
-        return None
-    if assmt['created_by'] != user_id:
-        return None
-    if assmt['status'] != 'live':
+    if not assmt or assmt['status'] != 'live':
         return None  # Can only end a live assessment
 
     db.execute(
@@ -1344,48 +1640,37 @@ def getAssessmentOverview(user_id, db, metadata, assmt_id):
     ca_has_students         = metadata.tables['ca_has_students']
     ca_question_submissions = metadata.tables['ca_question_submissions']
 
-    # Verify ownership
+    if not _checkAccess(user_id, assmt_id, db, metadata):
+        return None
+
     assmt = db.execute(
-        select(curiosity_assessment.c.created_by, curiosity_assessment.c.question_count)
+        select(curiosity_assessment.c.question_count)
         .where(curiosity_assessment.c.assmt_id == assmt_id)
     ).mappings().first()
 
-    if not assmt or assmt['created_by'] != user_id:
+    if not assmt:
         return None
 
     total_questions = assmt['question_count']
 
-    # Enrollment counts
-    enrollment = db.execute(
+    # Single pass over ca_has_students — compute enrollment counts and median elapsed in Python
+    student_rows = db.execute(
         select(
-            func.count(ca_has_students.c.student_id).label('total'),
-            func.sum(
-                case((ca_has_students.c.status == 'submitted', 1), else_=0)
-            ).label('submitted'),
-            func.avg(ca_has_students.c.time_elapsed_seconds).label('avg_elapsed')
+            ca_has_students.c.status,
+            ca_has_students.c.time_elapsed_seconds
         )
         .where(ca_has_students.c.ca_id == assmt_id)
-    ).mappings().first()
-
-    total_students = int(enrollment['total'] or 0)
-    submitted      = int(enrollment['submitted'] or 0)
-    missed         = total_students - submitted
-
-    # Median time — fetch all elapsed times and compute in Python
-    # (MySQL has no native MEDIAN aggregate)
-    elapsed_rows = db.execute(
-        select(ca_has_students.c.time_elapsed_seconds)
-        .where(
-            and_(
-                ca_has_students.c.ca_id == assmt_id,
-                ca_has_students.c.status == 'submitted',
-                ca_has_students.c.time_elapsed_seconds.isnot(None)
-            )
-        )
-        .order_by(ca_has_students.c.time_elapsed_seconds)
     ).mappings().all()
 
-    elapsed_values = [int(r['time_elapsed_seconds']) for r in elapsed_rows]
+    total_students = len(student_rows)
+    submitted      = sum(1 for r in student_rows if r['status'] == 'submitted')
+    missed         = total_students - submitted
+
+    elapsed_values = sorted(
+        int(r['time_elapsed_seconds'])
+        for r in student_rows
+        if r['status'] == 'submitted' and r['time_elapsed_seconds'] is not None
+    )
     if elapsed_values:
         mid = len(elapsed_values) // 2
         median_seconds = elapsed_values[mid] if len(elapsed_values) % 2 != 0 \
@@ -1456,17 +1741,15 @@ def getTopQuestions(user_id, db, metadata, assmt_id):
     ca_question_submissions = metadata.tables['ca_question_submissions']
     college_account_new     = metadata.tables['college_account_new']
 
-    # Verify ownership
     assmt = db.execute(
-        select(curiosity_assessment.c.created_by)
+        select(curiosity_assessment.c.assmt_id, curiosity_assessment.c.created_by)
         .where(curiosity_assessment.c.assmt_id == assmt_id)
     ).mappings().first()
 
-    if not assmt or assmt['created_by'] != user_id:
+    if not assmt or not _checkAccess(user_id, assmt_id, db, metadata, created_by=assmt['created_by']):
         return None
 
-    # Top 6 individual questions ranked by composite_score
-    top_rows = db.execute(
+    rows = db.execute(
         select(
             ca_question_submissions.c.q_id,
             ca_question_submissions.c.question,
@@ -1491,40 +1774,22 @@ def getTopQuestions(user_id, db, metadata, assmt_id):
         .limit(6)
     ).mappings().all()
 
-    if not top_rows:
+    if not rows:
         return None
 
-    # For each top question, count similar questions (±15% composite score band)
-    top_questions = []
-    for i, row in enumerate(top_rows):
-        ref_score  = float(row['composite_score'])
-        low_bound  = ref_score * 0.85
-        high_bound = ref_score * 1.15
-
-        similar_count = db.execute(
-            select(func.count(ca_question_submissions.c.q_id))
-            .where(
-                and_(
-                    ca_question_submissions.c.ca_id == assmt_id,
-                    ca_question_submissions.c.q_id != row['q_id'],
-                    ca_question_submissions.c.composite_score.between(low_bound, high_bound)
-                )
-            )
-        ).scalar()
-
-        top_questions.append(OrderedDict([
-            ('rank',          i + 1),
-            ('question_id',   row['q_id']),
-            ('prompt',        row['question']),
-            ('relevance',     float(row['r_score'])         if row['r_score']         else None),
-            ('bloom',         float(row['b_score'])         if row['b_score']         else None),
-            ('depth',         float(row['d_score'])         if row['d_score']         else None),
-            ('avg_score',     round(float(row['composite_score']), 2)),
-            ('similar_count', int(similar_count or 0)),
-            ('student_name',  row['student_name'])
-        ]))
-
-    return top_questions
+    return [
+        OrderedDict([
+            ('rank',         i + 1),
+            ('question_id',  row['q_id']),
+            ('prompt',       row['question']),
+            ('relevance',    float(row['r_score'])         if row['r_score']         else None),
+            ('bloom',        float(row['b_score'])         if row['b_score']         else None),
+            ('depth',        float(row['d_score'])         if row['d_score']         else None),
+            ('avg_score',    round(float(row['composite_score']), 2)),
+            ('student_name', row['student_name'])
+        ])
+        for i, row in enumerate(rows)
+    ]
 
 
 def getEndedAssessmentStudents(user_id, db, metadata, assmt_id,
@@ -1534,16 +1799,8 @@ def getEndedAssessmentStudents(user_id, db, metadata, assmt_id,
     ca_question_submissions = metadata.tables['ca_question_submissions']
     college_account_new     = metadata.tables['college_account_new']
 
-    # Verify ownership
-    assmt = db.execute(
-        select(curiosity_assessment.c.created_by, curiosity_assessment.c.question_count)
-        .where(curiosity_assessment.c.assmt_id == assmt_id)
-    ).mappings().first()
-
-    if not assmt or assmt['created_by'] != user_id:
+    if not _checkAccess(user_id, assmt_id, db, metadata):
         return None
-
-    total_questions = assmt['question_count']
 
     query = (
         select(
@@ -1557,7 +1814,8 @@ def getEndedAssessmentStudents(user_id, db, metadata, assmt_id,
             func.avg(ca_question_submissions.c.composite_score).label('avg_score'),
             func.avg(ca_question_submissions.c.r_score).label('avg_relevance'),
             func.avg(ca_question_submissions.c.b_score).label('avg_blooms'),
-            func.avg(ca_question_submissions.c.d_score).label('avg_depth')
+            func.avg(ca_question_submissions.c.d_score).label('avg_depth'),
+            curiosity_assessment.c.question_count
         )
         .select_from(
             ca_has_students
@@ -1568,6 +1826,8 @@ def getEndedAssessmentStudents(user_id, db, metadata, assmt_id,
                     ca_question_submissions.c.ca_id == ca_has_students.c.ca_id,
                     ca_question_submissions.c.student_id == ca_has_students.c.student_id
                 ))
+            .join(curiosity_assessment,
+                curiosity_assessment.c.assmt_id == ca_has_students.c.ca_id)
         )
         .where(ca_has_students.c.ca_id == assmt_id)
         .group_by(
@@ -1575,7 +1835,8 @@ def getEndedAssessmentStudents(user_id, db, metadata, assmt_id,
             ca_has_students.c.status,
             ca_has_students.c.submitted_at,
             ca_has_students.c.time_elapsed_seconds,
-            college_account_new.c.id
+            college_account_new.c.id,
+            curiosity_assessment.c.question_count
         )
     )
 
@@ -1625,7 +1886,7 @@ def getEndedAssessmentStudents(user_id, db, metadata, assmt_id,
             ('submitted_at', row['submitted_at'].isoformat() if row['submitted_at'] else None),
             ('time',         _format_duration(row['time_elapsed_seconds'])),
             ('q_count',      int(row['q_count'])),
-            ('q_total',      total_questions),
+            ('q_total',      row['question_count']),
             ('score',        avg),
             ('dims', OrderedDict([
                 ('relevance', round(float(row['avg_relevance']), 2) if row['avg_relevance'] else None),
@@ -1645,13 +1906,12 @@ def getSimilarQuestions(user_id, db, metadata, assmt_id, question_id):
     college_department_section_new = metadata.tables['college_department_section_new']
     student_section_mapping    = metadata.tables['student_section_mapping']
 
-    # Verify ownership
     assmt = db.execute(
-        select(curiosity_assessment.c.created_by)
+        select(curiosity_assessment.c.assmt_id, curiosity_assessment.c.created_by)
         .where(curiosity_assessment.c.assmt_id == assmt_id)
     ).mappings().first()
 
-    if not assmt or assmt['created_by'] != user_id:
+    if not assmt or not _checkAccess(user_id, assmt_id, db, metadata, created_by=assmt['created_by']):
         return None
 
     # Fetch reference question's composite score
@@ -1738,7 +1998,6 @@ def exportAssessment(user_id, db, metadata, assmt_id, fmt, columns):
     ca_has_sections            = metadata.tables['ca_has_sections']
     student_section_mapping    = metadata.tables['student_section_mapping']
 
-    # Verify ownership
     assmt = db.execute(
         select(
             curiosity_assessment.c.created_by,
@@ -1748,7 +2007,7 @@ def exportAssessment(user_id, db, metadata, assmt_id, fmt, columns):
         .where(curiosity_assessment.c.assmt_id == assmt_id)
     ).mappings().first()
 
-    if not assmt or assmt['created_by'] != user_id:
+    if not assmt or not _checkAccess(user_id, assmt_id, db, metadata, created_by=assmt['created_by']):
         return None
 
     # Fetch full dataset.
@@ -1840,13 +2099,12 @@ def shareAssessment(user_id, db, metadata, assmt_id, scope, emails):
     curiosity_assessment = metadata.tables['curiosity_assessment']
     ca_share             = metadata.tables['ca_share']
 
-    # Verify ownership
     assmt = db.execute(
-        select(curiosity_assessment.c.created_by)
+        select(curiosity_assessment.c.assmt_id, curiosity_assessment.c.created_by)
         .where(curiosity_assessment.c.assmt_id == assmt_id)
     ).mappings().first()
 
-    if not assmt or assmt['created_by'] != user_id:
+    if not assmt or not _checkAccess(user_id, assmt_id, db, metadata, created_by=assmt['created_by']):
         return None
 
     # Generate deterministic share token from assmt_id + a server secret

@@ -1,0 +1,965 @@
+================================================================================
+  CURIOSITY ASSESSMENT API — COMPLETE TESTING GUIDE
+  Project: Edwisely | File: testing_guide.txt | Updated: 2026-06-11
+================================================================================
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 1 — PREREQUISITES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Python 3.9+
+     python --version
+
+2. MySQL 8.0+ server running locally with the Edwisely database.
+
+3. .env file at project root — fill in YOUR credentials:
+
+     DB_HOST=<your_db_host>           e.g. localhost or 192.168.x.x
+     DB_PORT=<your_db_port>           e.g. 3306
+     DB_USER=<your_db_user>           e.g. root
+     DB_PASSWORD=<your_db_password>
+     DB_NAME=<your_db_name>           the Edwisely database name
+     FLASK_ENV=development
+     SHARE_TOKEN_SECRET=<any_random_string>
+     SENDGRID_API_KEY=                (leave blank for dev — error emails are skipped)
+
+   Verify the connection:
+     mysql -u <your_db_user> -p <your_db_name>
+
+4. Postman (recommended) or curl.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 2 — ENVIRONMENT SETUP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Step 1 — Open a terminal in the project directory:
+
+    cd "C:\Users\Tusha\OneDrive\Desktop\APIendpointsCodes"
+
+Step 2 — Activate the virtual environment:
+
+    .\.venv\Scripts\Activate.ps1     (PowerShell)
+    .\.venv\Scripts\activate.bat     (CMD)
+    source .venv/bin/activate        (Git Bash / WSL)
+
+    You should see (.venv) in your prompt.
+
+Step 3 — Install dependencies:
+
+    pip install -r requirements.txt
+
+Step 4 — Verify imports:
+
+    python -c "import flask, sqlalchemy, sendgrid; print('All OK')"
+
+    Expected: All OK
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 3 — RUN THE PRODUCTION MIGRATION (ONCE)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+If the database has not been migrated yet, run:
+
+    mysql -u <your_db_user> -p <your_db_name> < production_migration.sql
+
+This creates / alters the following tables:
+  curiosity_assessment    — adds created_by, rubric_relevance/blooms/depth,
+                            question_count, duration_minutes, document_id,
+                            subject_code, is_deleted, and CHECK constraint
+  ca_has_students         — adds status, submitted_at, time_elapsed_seconds
+  ca_question_submissions — adds question_number, question (TEXT), ai_feedback
+  ca_documents            — new table (doc_id PK)
+  ca_has_topics           — new table
+  ca_faculty_feedback     — new table
+  ca_share                — new table
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 4 — DATABASE SEED DATA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+All INSERTs below target only the 8 CA-specific tables created/altered by
+production_migration.sql. No other tables are touched.
+
+
+Score ranges (enforced by CHECK constraints on ca_question_submissions):
+  r_score  (relevance)  DECIMAL(5,2)   valid range: 0 – 100
+  b_score  (bloom's)    DECIMAL(3,2)   valid range: 1 – 6
+  d_score  (depth)      DECIMAL(3,2)   valid range: 1 – 4
+  rubric_relevance + rubric_blooms + rubric_depth must equal exactly 10
+
+────────────────────────────────────────────────────────────────────────────────
+Step 1 — Connect to the database:
+────────────────────────────────────────────────────────────────────────────────
+
+    mysql -u <your_db_user> -p <your_db_name>
+
+────────────────────────────────────────────────────────────────────────────────
+Step 2 — Decide your faculty user_id (the only lookup needed):
+────────────────────────────────────────────────────────────────────────────────
+
+    Use faculty_id as 1 for simplicity
+
+────────────────────────────────────────────────────────────────────────────────
+Step 3 — Run the following SQL block in one mysql session:
+────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────
+4.1  Set your faculty user_id
+────────────────────────────────────────────────────────────────────────────────
+
+SET @F = 1;
+-- All other IDs below are arbitrary and need no lookups.
+
+────────────────────────────────────────────────────────────────────────────────
+4.2  Documents (ca_documents)
+────────────────────────────────────────────────────────────────────────────────
+
+-- Columns: doc_id (AUTO), uploaded_by, name, size_bytes, pages,
+--          storage_url, uploaded_at
+
+INSERT INTO ca_documents
+    (uploaded_by, name, size_bytes, pages, storage_url, uploaded_at)
+VALUES
+    (@F, 'lecture_notes.pdf', 524288, 18,
+     '/uploads/ca_documents/lecture_notes.pdf', NOW());
+
+SET @DOC = LAST_INSERT_ID();    -- save generated doc_id
+
+────────────────────────────────────────────────────────────────────────────────
+4.3  Assessments (curiosity_assessment)
+────────────────────────────────────────────────────────────────────────────────
+
+-- Assessment A: topic-based, status = LIVE
+--   Used for: monitoring stats, roster, student submissions, overview, export, share
+INSERT INTO curiosity_assessment
+    (created_by, topic_source, assmt_title, assmt_brief,
+     question_count, duration_minutes, subject_code, document_id,
+     rubric_relevance, rubric_blooms, rubric_depth,
+     status, start_time, end_time, is_deleted, created_at, updated_at)
+VALUES
+    (@F, 'topic', 'Data Structures Mid-Term',
+     'Live curiosity assessment for Section A',
+     10, 30, 'CS101', NULL,
+     4, 3, 3,
+     'live',
+     DATE_SUB(NOW(), INTERVAL 30 MINUTE),
+     DATE_ADD(NOW(), INTERVAL 30 MINUTE),
+     0, NOW(), NOW());
+
+SET @A1 = LAST_INSERT_ID();     -- save generated assmt_id (e.g. 1)
+
+-- Assessment B: document-based, status = DRAFT
+--   Used for: create / update / delete / duplicate tests
+INSERT INTO curiosity_assessment
+    (created_by, topic_source, assmt_title, assmt_brief,
+     question_count, duration_minutes, subject_code, document_id,
+     rubric_relevance, rubric_blooms, rubric_depth,
+     status, start_time, end_time, is_deleted, created_at, updated_at)
+VALUES
+    (@F, 'document', 'Chapter 3 PDF Quiz', NULL,
+     5, 20, NULL, @DOC,
+     5, 3, 2,
+     'draft', NULL, NULL,
+     0, NOW(), NOW());
+
+SET @A2 = LAST_INSERT_ID();     -- save generated assmt_id (e.g. 2)
+
+────────────────────────────────────────────────────────────────────────────────
+4.4  Sections and topics (ca_has_sections, ca_has_topics)
+────────────────────────────────────────────────────────────────────────────────
+
+-- section_id 10 is arbitrary (no FK constraint to college_department_section_new)
+INSERT INTO ca_has_sections (ca_id, section_id)
+VALUES (@A1, 10), (@A2, 10);
+
+-- topic_ids 5, 6, 7 are arbitrary (no FK constraint to topics)
+INSERT INTO ca_has_topics (ca_id, topic_id)
+VALUES (@A1, 5), (@A1, 6), (@A1, 7);
+
+────────────────────────────────────────────────────────────────────────────────
+4.5  Student enrollments (ca_has_students)
+────────────────────────────────────────────────────────────────────────────────
+
+-- student_ids 101, 102, 103 are arbitrary (no FK constraint to college_account_new)
+-- status ENUM: 'not_started' | 'writing' | 'submitted'
+
+INSERT INTO ca_has_students
+    (ca_id, student_id, status, added_at, submitted_at, time_elapsed_seconds)
+VALUES
+    (@A1, 101, 'submitted', NOW(), DATE_SUB(NOW(), INTERVAL 20 MINUTE), 1200),
+    (@A1, 102, 'submitted', NOW(), DATE_SUB(NOW(), INTERVAL 15 MINUTE),  900),
+    (@A1, 103, 'writing',   NOW(), NULL,                                 NULL);
+
+────────────────────────────────────────────────────────────────────────────────
+4.6  Question submissions (ca_question_submissions)
+────────────────────────────────────────────────────────────────────────────────
+
+-- q_id is AUTO_INCREMENT — do NOT include it in the INSERT.
+-- question : full text of the student's submitted question (TEXT, NOT NULL)
+-- r_score  : relevance,   DECIMAL(5,2),  must be 0–100
+-- b_score  : bloom's,     DECIMAL(3,2),  must be 1–6
+-- d_score  : depth,       DECIMAL(3,2),  must be 1–4
+
+INSERT INTO ca_question_submissions
+    (ca_id, student_id, question_number, question,
+     r_score, b_score, d_score, composite_score, ai_feedback, submitted_at)
+VALUES
+  -- Student 101, question 1
+  (@A1, 101, 1,
+   'Explain how a stack uses LIFO ordering and give a real-world example.',
+   82.00, 4.50, 3.20, 7.80,
+   'Good grasp of LIFO. Elaborate on how push and pop maintain the invariant.',
+   DATE_SUB(NOW(), INTERVAL 20 MINUTE)),
+
+  -- Student 101, question 2
+  (@A1, 101, 2,
+   'What is the time complexity of binary search and why?',
+   90.00, 5.00, 3.80, 9.00,
+   'Excellent. Consider edge cases for odd-length arrays.',
+   DATE_SUB(NOW(), INTERVAL 20 MINUTE)),
+
+  -- Student 101, question 3
+  (@A1, 101, 3,
+   'Describe a use case where a doubly linked list is preferable to a singly linked list.',
+   75.00, 4.00, 2.90, 7.00,
+   'Solid answer. Browser history navigation is a classic example.',
+   DATE_SUB(NOW(), INTERVAL 20 MINUTE)),
+
+  -- Student 102, question 1
+  (@A1, 102, 1,
+   'What is a stack and when would you use one in a program?',
+   60.00, 3.00, 2.10, 5.30,
+   'Basic definition given. Needs more depth on application scenarios.',
+   DATE_SUB(NOW(), INTERVAL 15 MINUTE)),
+
+  -- Student 102, question 2
+  (@A1, 102, 2,
+   'How does a hash table handle collisions? Name two strategies.',
+   55.00, 2.80, 2.00, 4.80,
+   'Mentioned chaining but missed open addressing. Review both.',
+   DATE_SUB(NOW(), INTERVAL 15 MINUTE)),
+
+  -- Student 102, question 3
+  (@A1, 102, 3,
+   'What is the difference between a tree and a graph data structure?',
+   70.00, 3.50, 2.50, 6.20,
+   'Good distinction drawn. Add examples of cyclic graphs.',
+   DATE_SUB(NOW(), INTERVAL 15 MINUTE));
+
+SET @Q1 = LAST_INSERT_ID() - 5;  -- q_id of student 101's first question
+
+────────────────────────────────────────────────────────────────────────────────
+4.7  Faculty feedback (ca_faculty_feedback)
+────────────────────────────────────────────────────────────────────────────────
+
+INSERT INTO ca_faculty_feedback (ca_id, student_id, sent_by, message, sent_at)
+VALUES
+    (@A1, 101, @F,
+     'Great effort on arrays! Review linked list node structure before the final.',
+     NOW()),
+    (@A1, 102, @F,
+     'Good attempt. Focus on collision resolution strategies for next session.',
+     NOW());
+
+────────────────────────────────────────────────────────────────────────────────
+4.8  Verify seed data and note the generated IDs
+────────────────────────────────────────────────────────────────────────────────
+
+SELECT @A1 AS live_assessment_id,
+       @A2 AS draft_assessment_id,
+       @DOC AS document_id,
+       @Q1 AS first_question_id;
+
+SELECT assmt_id, assmt_title, status       FROM curiosity_assessment;
+SELECT ca_id, student_id, status           FROM ca_has_students;
+SELECT q_id, ca_id, student_id, question_number
+                                           FROM ca_question_submissions ORDER BY q_id;
+SELECT feedback_id, ca_id, student_id     FROM ca_faculty_feedback;
+
+-- Use these IDs in all curl / Postman commands in Sections 7 and 8:
+--   Authorization: Bearer <your @F value>
+--   assessment_id = @A1 value  (live)  |  @A2 value  (draft)
+--   student_id    = 101 or 102
+--   section_id    = 10
+--   document_id   = @DOC value
+--   question_id   = @Q1 value
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 5 — STARTING THE SERVER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Step 1 — Activate venv (if not already done).
+
+Step 2 — Start Flask:
+    python app.py
+
+Expected output:
+    * Running on http://127.0.0.1:5000
+    * Debug mode: on
+
+Step 3 — Keep this terminal open. Open a second terminal for sending requests.
+
+BASE URL: http://127.0.0.1:5000
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 6 — AUTHENTICATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+EVERY request needs this header:
+
+    Authorization: Bearer <user_id>
+
+For dev testing, the token IS the integer id from college_account_new:
+    Authorization: Bearer 1     (faculty)
+    Authorization: Bearer 2     (HOD)
+    Authorization: Bearer 3     (principal)
+
+Missing or malformed header returns:
+    {"status": 401, "message": "Unauthorized — send: Authorization: Bearer <user_id>"}
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 7 — POSTMAN ENVIRONMENT VARIABLES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Setting up an Environment in Postman saves you from retyping the base URL and
+token on every request. All curl commands in Section 8 map directly to these
+variables.
+
+────────────────────────────────────────────────────────────────────────────────
+7.1  Create the Environment
+────────────────────────────────────────────────────────────────────────────────
+
+1. In Postman, click the Environments icon (top-right gear icon or left sidebar).
+2. Click  + New Environment.
+3. Name it:  Curiosity Assessment - Dev
+
+────────────────────────────────────────────────────────────────────────────────
+7.2  Add these variables
+────────────────────────────────────────────────────────────────────────────────
+
+Variable Name         | Initial Value              | Description
+----------------------+----------------------------+---------------------------------
+base_url              | http://127.0.0.1:5000      | Flask server base URL
+auth_faculty          | Bearer 1                   | Faculty user header value
+auth_hod              | Bearer 2                   | HOD user header value
+auth_principal        | Bearer 3                   | Principal user header value
+assessment_id         | 1                          | The seeded live assessment id (@A1)
+student_id            | 101                        | Seeded student id
+section_id            | 10                         | Seeded section id (arbitrary)
+subject_code          | CS101                      | Seeded subject code
+document_id           | 1                          | Seeded ca_documents doc_id (@DOC)
+question_id           | 1                          | First question id (@Q1 from seed)
+
+After adding, click  Save.
+
+────────────────────────────────────────────────────────────────────────────────
+7.3  Select the Environment
+────────────────────────────────────────────────────────────────────────────────
+
+Use the Environment selector (top-right dropdown) to choose
+"Curiosity Assessment - Dev" before sending any requests.
+
+────────────────────────────────────────────────────────────────────────────────
+7.4  How to use variables in Postman requests
+────────────────────────────────────────────────────────────────────────────────
+
+In the URL field:
+    {{base_url}}/assessments
+
+In the Headers tab:
+    Key:    Authorization
+    Value:  {{auth_faculty}}
+
+In the URL query params tab (or append to URL):
+    Key: view   Value: stats
+
+In the Body tab (raw JSON):
+    Use literal values from Section 8 below — no variable substitution needed
+    in the body since those are fixed test values.
+
+────────────────────────────────────────────────────────────────────────────────
+7.5  Collection-level Authorization (optional shortcut)
+────────────────────────────────────────────────────────────────────────────────
+
+1. Create a Collection named  "Curiosity Assessment API".
+2. In the Collection > Authorization tab:
+     Type:      API Key
+     Key:       Authorization
+     Value:     {{auth_faculty}}
+     Add to:    Header
+3. Individual requests will inherit this header automatically.
+   Override it per-request for HOD/Principal tests.
+
+────────────────────────────────────────────────────────────────────────────────
+7.6  For the POST /documents file upload in Postman
+────────────────────────────────────────────────────────────────────────────────
+
+1. Method: POST  |  URL: {{base_url}}/documents
+2. Headers: Authorization: {{auth_faculty}}
+3. Body tab → form-data
+4. Add a row:
+     Key:   file    (set TYPE dropdown to  File)
+     Value: choose a PDF from your filesystem
+5. Send.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 8 — ENDPOINT TESTS  (curl — PowerShell format)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+IMPORTANT — API body vs DB column names
+  The API request/response uses friendly names. The data layer maps them to DB:
+    API  "title"       →  DB  assmt_title
+    API  "description" →  DB  assmt_brief
+    API  "source_kind" →  DB  topic_source
+    API  "rubric"      →  DB  rubric_relevance + rubric_blooms + rubric_depth
+  So always use the API names in request bodies, not the DB column names.
+
+RUBRIC FORMAT
+  The rubric object in POST/PATCH bodies must have exactly these three keys
+  and the values must sum to 10:
+    {"relevance": 4, "blooms": 3, "depth": 3}   ✓  (4+3+3 = 10)
+    {"relevance": 5, "blooms": 3, "depth": 2}   ✓  (5+3+2 = 10)
+    {"correct": 1, "incorrect": -0.25}           ✗  (WRONG format — DB will reject)
+
+RECIPIENTS FORMAT
+  Each recipient item uses the key  "kind"  (not  "type"):
+    [{"kind": "section", "id": 10}]              ✓
+    [{"type": "section", "id": 10}]              ✗  (WRONG — ignored by data layer)
+
+PowerShell note: if curl resolves to Invoke-WebRequest, use curl.exe instead.
+
+────────────────────────────────────────────────────────────────────────────────
+8.1  GET /assessments — Library list
+────────────────────────────────────────────────────────────────────────────────
+
+--- Test A: All assessments (no filters) ---
+curl.exe -X GET "http://127.0.0.1:5000/assessments" `
+  -H "Authorization: Bearer 1"
+
+Expected:
+{
+  "status": 200,
+  "data": {
+    "assessments": [{"assmt_id":1, "title":"Data Structures Mid-Term", ...}],
+    "filters": {"subjects":[...], "sections":[...]}
+  }
+}
+
+--- Test B: Filter by status=live ---
+curl.exe -X GET "http://127.0.0.1:5000/assessments?status=live" `
+  -H "Authorization: Bearer 1"
+
+--- Test C: Filter by status=draft (expect 200 with empty list if none) ---
+curl.exe -X GET "http://127.0.0.1:5000/assessments?status=draft" `
+  -H "Authorization: Bearer 1"
+
+--- Test D: Filter by section ---
+curl.exe -X GET "http://127.0.0.1:5000/assessments?section_id=10" `
+  -H "Authorization: Bearer 1"
+
+--- Test E: Filter by subject ---
+curl.exe -X GET "http://127.0.0.1:5000/assessments?subject_code=CS101" `
+  -H "Authorization: Bearer 1"
+
+--- Test F: No auth header (expect 401) ---
+curl.exe -X GET "http://127.0.0.1:5000/assessments"
+Expected: {"status": 401, "message": "Unauthorized..."}
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.2  GET /assessments/filters — Library filter dropdowns
+────────────────────────────────────────────────────────────────────────────────
+
+curl.exe -X GET "http://127.0.0.1:5000/assessments/filters" `
+  -H "Authorization: Bearer 1"
+
+Expected:
+{
+  "status": 200,
+  "data": {
+    "subjects": [{"subject_code": "CS101"}],
+    "sections": []
+  }
+}
+NOTE: sections returns [] because section_id=10 is arbitrary and has no matching
+row in college_department_section_new. To see a real section name here, use a
+section_id that exists in that institutional table.
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.3  POST /assessments — Create assessment
+────────────────────────────────────────────────────────────────────────────────
+
+BODY FIELD REFERENCE:
+  title            — maps to DB assmt_title         (required)
+  description      — maps to DB assmt_brief          (optional)
+  source_kind      — "topic" or "document"          (required)
+  topic_ids        — list of topic IDs, required when source_kind=topic
+  document_id      — doc_id from ca_documents, required when source_kind=document
+  subject_code     — used when source_kind=topic     (optional)
+  recipients       — list of {kind: "section", id: N} items (required)
+  question_count   — integer                         (required)
+  duration_minutes — integer                         (required)
+  rubric           — {relevance, blooms, depth} summing to 10  (required)
+  start_time       — ISO 8601 string, e.g. "2026-06-12T09:00:00"  (optional)
+  end_time         — ISO 8601 string                              (optional)
+  status           — "draft" (default) or "live"    (optional)
+
+--- Test A: Create topic-based draft ---
+curl.exe -X POST "http://127.0.0.1:5000/assessments" `
+  -H "Authorization: Bearer 1" `
+  -H "Content-Type: application/json" `
+  -d "{\"title\": \"Arrays Quiz\", \"description\": \"Quick quiz on arrays\", \"source_kind\": \"topic\", \"topic_ids\": [1, 2], \"subject_code\": \"CS101\", \"recipients\": [{\"kind\": \"section\", \"id\": 5}], \"question_count\": 5, \"duration_minutes\": 20, \"rubric\": {\"relevance\": 4, \"blooms\": 3, \"depth\": 3}, \"start_time\": \"2026-06-12T09:00:00\", \"end_time\": \"2026-06-12T09:30:00\", \"status\": \"draft\"}"
+
+Expected:
+  {"status": 200, "data": {"assmt_id": 2, "title": "Arrays Quiz", ...}}
+
+--- Test B: Create document-based draft ---
+curl.exe -X POST "http://127.0.0.1:5000/assessments" `
+  -H "Authorization: Bearer 1" `
+  -H "Content-Type: application/json" `
+  -d "{\"title\": \"Chapter 3 Quiz\", \"source_kind\": \"document\", \"document_id\": 1, \"recipients\": [{\"kind\": \"section\", \"id\": 5}], \"question_count\": 10, \"duration_minutes\": 30, \"rubric\": {\"relevance\": 5, \"blooms\": 3, \"depth\": 2}, \"status\": \"draft\"}"
+
+--- Test C: Launch as live immediately ---
+  Same as Test A but set "status": "live". The data layer will automatically
+  expand section 5 into individual ca_has_students rows.
+
+--- Test D: Missing required field (expect 422) ---
+curl.exe -X POST "http://127.0.0.1:5000/assessments" `
+  -H "Authorization: Bearer 1" `
+  -H "Content-Type: application/json" `
+  -d "{\"title\": \"Incomplete\"}"
+Expected: {"status": 422, "message": "source_kind is missing"}
+
+--- Test E: source_kind=topic without topic_ids (expect 422) ---
+curl.exe -X POST "http://127.0.0.1:5000/assessments" `
+  -H "Authorization: Bearer 1" `
+  -H "Content-Type: application/json" `
+  -d "{\"title\": \"T\", \"source_kind\": \"topic\", \"recipients\": [{\"kind\": \"section\", \"id\": 5}], \"question_count\": 5, \"duration_minutes\": 20, \"rubric\": {\"relevance\": 4, \"blooms\": 3, \"depth\": 3}}"
+Expected: {"status": 422, "message": "topic_ids is required when source_kind is topic"}
+
+--- Test F: Missing body (expect 422) ---
+curl.exe -X POST "http://127.0.0.1:5000/assessments" `
+  -H "Authorization: Bearer 1"
+Expected: {"status": 422, "message": "Request body is missing"}
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.4  GET /assessments/<id> — Multi-view detail endpoint
+────────────────────────────────────────────────────────────────────────────────
+
+The "view" query param selects which data to return. Use assessment_id=1.
+
+--- view=stats (Live Monitoring stats bar — polled every ~5s) ---
+curl.exe -X GET "http://127.0.0.1:5000/assessments/1?view=stats" `
+  -H "Authorization: Bearer 1"
+
+Expected: total_students, submitted_count, in_progress_count, avg_score,
+          time remaining (closes_in), etc.
+
+--- view=roster (Live student list) ---
+curl.exe -X GET "http://127.0.0.1:5000/assessments/1?view=roster" `
+  -H "Authorization: Bearer 1"
+
+--- view=roster with status filter ---
+curl.exe -X GET "http://127.0.0.1:5000/assessments/1?view=roster&status=writing" `
+  -H "Authorization: Bearer 1"
+
+--- view=roster with sort ---
+curl.exe -X GET "http://127.0.0.1:5000/assessments/1?view=roster&sort=score_desc" `
+  -H "Authorization: Bearer 1"
+
+--- view=syllabus (topic/document drawer) ---
+curl.exe -X GET "http://127.0.0.1:5000/assessments/1?view=syllabus" `
+  -H "Authorization: Bearer 1"
+
+--- view=overview (Results summary after assessment ends) ---
+curl.exe -X GET "http://127.0.0.1:5000/assessments/1?view=overview" `
+  -H "Authorization: Bearer 1"
+
+--- view=top_questions ---
+curl.exe -X GET "http://127.0.0.1:5000/assessments/1?view=top_questions" `
+  -H "Authorization: Bearer 1"
+
+--- view=students (Ended student list with scores) ---
+curl.exe -X GET "http://127.0.0.1:5000/assessments/1?view=students" `
+  -H "Authorization: Bearer 1"
+
+--- view=students with filters ---
+curl.exe -X GET "http://127.0.0.1:5000/assessments/1?view=students&score_band=high&sort=score_desc" `
+  -H "Authorization: Bearer 1"
+
+--- view=similar (similar questions) ---
+curl.exe -X GET "http://127.0.0.1:5000/assessments/1?view=similar&question_id=1" `
+  -H "Authorization: Bearer 1"
+
+--- view=export ---
+  Available columns: name, roll, section, total_score, relevance_pct,
+                     blooms_level, depth, q_submitted, submission_time
+  name and roll are always included.
+
+curl.exe -X GET "http://127.0.0.1:5000/assessments/1?view=export&format=csv&columns[]=section&columns[]=total_score&columns[]=submission_time" `
+  -H "Authorization: Bearer 1"
+
+--- Validation errors ---
+  Missing view:           GET /assessments/1
+                          → {"status": 422, "message": "view param is required"}
+
+  Unknown view:           GET /assessments/1?view=unknown
+                          → {"status": 422, "message": "unrecognised view param"}
+
+  similar, no question_id: GET /assessments/1?view=similar
+                          → {"status": 422, "message": "question_id is missing"}
+
+  export, no format:      GET /assessments/1?view=export
+                          → {"status": 422, "message": "format is missing"}
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.5  PATCH /assessments/<id> — Update / end / share
+────────────────────────────────────────────────────────────────────────────────
+
+--- Partial field update (any combination of fields) ---
+curl.exe -X PATCH "http://127.0.0.1:5000/assessments/1" `
+  -H "Authorization: Bearer 1" `
+  -H "Content-Type: application/json" `
+  -d "{\"title\": \"Data Structures Quiz (Updated)\", \"duration_minutes\": 45}"
+
+Expected: {"status": 200, "data": {"assmt_id": 1, "title": "Data Structures Quiz (Updated)", ...}}
+
+--- Update rubric (values must still sum to 10) ---
+curl.exe -X PATCH "http://127.0.0.1:5000/assessments/1" `
+  -H "Authorization: Bearer 1" `
+  -H "Content-Type: application/json" `
+  -d "{\"rubric\": {\"relevance\": 5, \"blooms\": 3, \"depth\": 2}}"
+
+--- Update recipients / sections ---
+curl.exe -X PATCH "http://127.0.0.1:5000/assessments/1" `
+  -H "Authorization: Bearer 1" `
+  -H "Content-Type: application/json" `
+  -d "{\"recipients\": [{\"kind\": \"section\", \"id\": 5}]}"
+
+--- action=end (set status=ended; only works if current status=live) ---
+curl.exe -X PATCH "http://127.0.0.1:5000/assessments/1" `
+  -H "Authorization: Bearer 1" `
+  -H "Content-Type: application/json" `
+  -d "{\"action\": \"end\"}"
+
+Expected: {"status": 200, "data": {"assmt_id": 1, "status": "ended", ...}}
+Note: endAssessment() returns 400 if status is not currently "live".
+
+--- action=share (scope must be one of: faculty | department | hod | college) ---
+curl.exe -X PATCH "http://127.0.0.1:5000/assessments/1" `
+  -H "Authorization: Bearer 1" `
+  -H "Content-Type: application/json" `
+  -d "{\"action\": \"share\", \"scope\": \"college\"}"
+
+Expected: {"status": 200, "data": {"share_url": "https://sastra.ai/assessments/1/results?token=..."}}
+
+--- action=share with email notification ---
+curl.exe -X PATCH "http://127.0.0.1:5000/assessments/1" `
+  -H "Authorization: Bearer 1" `
+  -H "Content-Type: application/json" `
+  -d "{\"action\": \"share\", \"scope\": \"department\", \"emails\": [\"colleague@edwisely.com\"]}"
+
+--- Missing body (expect 422) ---
+curl.exe -X PATCH "http://127.0.0.1:5000/assessments/1" `
+  -H "Authorization: Bearer 1"
+Expected: {"status": 422, "message": "Request body is missing"}
+
+--- action=share missing scope (expect 422) ---
+curl.exe -X PATCH "http://127.0.0.1:5000/assessments/1" `
+  -H "Authorization: Bearer 1" `
+  -H "Content-Type: application/json" `
+  -d "{\"action\": \"share\"}"
+Expected: {"status": 422, "message": "scope is missing"}
+
+--- Status transitions (allowed vs blocked) ---
+  draft → draft, scheduled, live       ✓  allowed
+  scheduled → draft, scheduled, live   ✓  allowed
+  live → ended                         ✓  via action=end only
+  ended → anything                     ✗  blocked (returns 400)
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.6  DELETE /assessments/<id> — Soft delete
+────────────────────────────────────────────────────────────────────────────────
+
+Soft delete sets is_deleted=1 in curiosity_assessment. The row is NOT removed.
+
+curl.exe -X DELETE "http://127.0.0.1:5000/assessments/2" `
+  -H "Authorization: Bearer 1"
+
+Expected: {"status": 200, "data": {"assmt_id": 2}}
+
+After this, GET /assessments no longer returns assessment 2.
+Use assessment_id=1 for all remaining tests.
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.7  POST /assessments/<id>/duplicate
+────────────────────────────────────────────────────────────────────────────────
+
+Copies the assessment (including sections, topics, and audience) as a new draft.
+Question submissions and faculty feedback are NOT copied.
+
+curl.exe -X POST "http://127.0.0.1:5000/assessments/1/duplicate" `
+  -H "Authorization: Bearer 1"
+
+Expected: {"status": 200, "data": {"assmt_id": <new_id>, "title": "Data Structures Mid-Term (Copy)", ...}}
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.8  GET /assessments/<id>/students/<student_id>/stats — Per-student breakdown
+────────────────────────────────────────────────────────────────────────────────
+
+Returns the question-by-question submission detail for a single student.
+
+curl.exe -X GET "http://127.0.0.1:5000/assessments/1/students/101/stats" `
+  -H "Authorization: Bearer 1"
+
+Expected: list of submitted questions with q_id, composite_score, r_score,
+          b_score, d_score, ai_feedback, question_number.
+
+--- Non-existent student (expect 400) ---
+curl.exe -X GET "http://127.0.0.1:5000/assessments/1/students/999/stats" `
+  -H "Authorization: Bearer 1"
+Expected: {"status": 400, "message": "No Data Found!!"}
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.9  POST /assessments/<id>/students/<student_id>/feedback
+────────────────────────────────────────────────────────────────────────────────
+
+Inserts a row into ca_faculty_feedback (ca_id, student_id, sent_by, message).
+
+curl.exe -X POST "http://127.0.0.1:5000/assessments/1/students/101/feedback" `
+  -H "Authorization: Bearer 1" `
+  -H "Content-Type: application/json" `
+  -d "{\"message\": \"Great effort on arrays! Review linked list node structure.\"}"
+
+Expected: {"status": 200, "data": {"feedback_id": 1, "sent_at": "2026-06-11T..."}}
+
+--- Missing message (expect 422) ---
+curl.exe -X POST "http://127.0.0.1:5000/assessments/1/students/101/feedback" `
+  -H "Authorization: Bearer 1" `
+  -H "Content-Type: application/json" `
+  -d "{}"
+Expected: {"status": 422, "message": "message is missing"}
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.10 GET /compose-audience — Audience picker filters
+────────────────────────────────────────────────────────────────────────────────
+
+--- Sections (faculty) ---
+curl.exe -X GET "http://127.0.0.1:5000/compose-audience?role=faculty&filter_type=sections" `
+  -H "Authorization: Bearer 1"
+Expected: [] — section_id=10 is arbitrary; it has no row in college_department_section_new,
+so the institutional join returns nothing. Use a real section_id to get a populated list.
+
+--- Sections (HOD) ---
+curl.exe -X GET "http://127.0.0.1:5000/compose-audience?role=hod&filter_type=sections" `
+  -H "Authorization: Bearer 2"
+
+--- Semesters (HOD only) ---
+curl.exe -X GET "http://127.0.0.1:5000/compose-audience?role=hod&filter_type=semesters" `
+  -H "Authorization: Bearer 2"
+
+--- Semesters with department_code filter ---
+curl.exe -X GET "http://127.0.0.1:5000/compose-audience?role=hod&filter_type=semesters&department_code=CSE" `
+  -H "Authorization: Bearer 2"
+
+--- Semesters as faculty (expect 403) ---
+curl.exe -X GET "http://127.0.0.1:5000/compose-audience?role=faculty&filter_type=semesters" `
+  -H "Authorization: Bearer 1"
+Expected: {"status": 403, "message": "Access denied"}
+
+--- Departments (principal only) ---
+curl.exe -X GET "http://127.0.0.1:5000/compose-audience?role=principal&filter_type=departments" `
+  -H "Authorization: Bearer 3"
+
+--- Departments as HOD (expect 403) ---
+curl.exe -X GET "http://127.0.0.1:5000/compose-audience?role=hod&filter_type=departments" `
+  -H "Authorization: Bearer 2"
+Expected: {"status": 403, "message": "Access denied"}
+
+--- Students for a section ---
+curl.exe -X GET "http://127.0.0.1:5000/compose-audience?role=faculty&filter_type=students&section_id=10" `
+  -H "Authorization: Bearer 1"
+
+--- Student search by name ---
+curl.exe -X GET "http://127.0.0.1:5000/compose-audience?role=faculty&filter_type=students&q=alice" `
+  -H "Authorization: Bearer 1"
+
+--- Validation errors ---
+  Missing role:         → {"status": 422, "message": "role is missing"}
+  Missing filter_type:  → {"status": 422, "message": "filter_type is missing"}
+  Unknown filter_type:  → {"status": 422, "message": "unrecognised filter_type param"}
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.11 GET /compose-syllabus — Subject and topic picker
+────────────────────────────────────────────────────────────────────────────────
+
+--- Get subjects list ---
+curl.exe -X GET "http://127.0.0.1:5000/compose-syllabus?type=subjects" `
+  -H "Authorization: Bearer 1"
+
+Expected:
+[{"subject_master_id":1, "subject_name":"Data Structures", "subject_code":"CS101",
+  "subject_semester_id":1}]
+
+--- Get topics for a subject ---
+curl.exe -X GET "http://127.0.0.1:5000/compose-syllabus?type=topics&subject_code=CS101" `
+  -H "Authorization: Bearer 1"
+
+Expected:
+{"subject_code":"CS101","units":[{"unit_id":1,"unit_name":"Arrays"},
+  {"unit_id":2,"unit_name":"Linked Lists"},{"unit_id":3,"unit_name":"Trees"}]}
+
+--- Validation errors ---
+  Missing type:              → {"status": 422, "message": "type is missing"}
+  topics missing subject_code: → {"status": 422, "message": "subject_code is missing"}
+  Unknown type:              → {"status": 422, "message": "unrecognised type param"}
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.12 POST /documents — Upload document
+────────────────────────────────────────────────────────────────────────────────
+
+Inserts into ca_documents (uploaded_by, name, size_bytes, pages, storage_url).
+Returns doc_id to use as document_id in POST /assessments.
+
+curl.exe -X POST "http://127.0.0.1:5000/documents" `
+  -H "Authorization: Bearer 1" `
+  -F "file=@C:\path\to\your\file.pdf"
+
+Expected:
+{"status": 200, "data": {"document_id": 2, "name": "file.pdf", "size": 204800, "pages": 12}}
+
+--- Missing file (expect 422) ---
+curl.exe -X POST "http://127.0.0.1:5000/documents" `
+  -H "Authorization: Bearer 1"
+Expected: {"status": 422, "message": "file is missing"}
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 9 — END-TO-END HAPPY-PATH FLOW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Run these 20 steps in order to exercise every capability once:
+
+1.  GET /compose-audience?role=faculty&filter_type=sections
+    → Confirm section_id 10 appears in the response.
+
+2.  GET /compose-syllabus?type=subjects
+    → Confirm subject "Data Structures / CS101" is returned.
+
+3.  GET /compose-syllabus?type=topics&subject_code=CS101
+    → Confirm units: Arrays, Linked Lists, Trees.
+
+4.  POST /assessments   (source_kind=topic, status=draft, rubric sums to 10)
+    → Note the returned assmt_id (e.g. 2).
+
+5.  GET /assessments?status=draft
+    → Confirm assessment 2 appears.
+
+6.  PATCH /assessments/2   (update title and duration_minutes)
+    → Confirm new title is returned.
+
+7.  GET /assessments/filters
+    → Confirm CS101 appears in subjects filter.
+
+8.  PATCH /assessments/2   {"status": "live"}
+    → Transitions assessment to live. Students in section 5 get
+      not_started rows added to ca_has_students automatically.
+
+9.  GET /assessments/1?view=stats
+    → Check live stats (using the seeded assessment, which already has students).
+
+10. GET /assessments/1?view=roster
+    → Check live roster; Charlie should appear as "writing".
+
+11. GET /assessments/1/students/101/stats
+    → Alice's submission detail from ca_question_submissions.
+
+12. POST /assessments/1/students/101/feedback
+    → Send a message. Verify feedback_id in response.
+
+13. PATCH /assessments/1   {"action": "end"}
+    → Ends the live assessment.
+
+14. GET /assessments/1?view=overview
+    → Verify avg_score, top_score, distribution.
+
+15. GET /assessments/1?view=top_questions
+    → See questions sorted by error rate.
+
+16. GET /assessments/1?view=students
+    → Full student results list with scores.
+
+17. GET /assessments/1?view=similar&question_id=1
+    → Similar questions for question 1.
+
+18. GET /assessments/1?view=export&format=csv&columns[]=total_score&columns[]=submission_time
+    → Export CSV data.
+
+19. PATCH /assessments/1   {"action": "share", "scope": "college"}
+    → Get share_url from response.
+
+20. DELETE /assessments/2
+    → Soft-delete the draft from step 4. Confirm it vanishes from GET /assessments.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 10 — COMMON ERRORS AND FIXES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Problem: 401 Unauthorized on every request
+Fix: Add header  Authorization: Bearer 1  (the user id must exist in
+     college_account_new.id).
+
+Problem: Server crashes on startup with ModuleNotFoundError
+Fix: pip install -r requirements.txt  (ensure venv is active).
+
+Problem: "Can't connect to MySQL server"
+Fix: Confirm MySQL is running and .env has correct DB_* values.
+     Test:  mysql -u root -p edwisely_cm_db
+
+Problem: 500 Failure on a specific endpoint
+Fix: Check the Flask terminal — it logs the exception traceback.
+     Common cause: missing table or column in the DB.
+     Run the migration first if not done:
+       mysql -u root -p edwisely_cm_db < production_migration.sql
+
+Problem: 400 No Data Found on GET endpoints
+Fix: The seed INSERTs in Section 4 need to be run first.
+     Verify the tables have rows:
+       SELECT * FROM curiosity_assessment;
+       SELECT * FROM ca_has_students;
+
+Problem: CHECK constraint fails on curiosity_assessment INSERT
+Fix: rubric_relevance + rubric_blooms + rubric_depth must equal exactly 10.
+     e.g.  4 + 3 + 3 = 10  ✓
+
+Problem: KeyError: '<table_name>' on startup
+Fix: metadata.reflect() couldn't find that table in the DB.
+     Check: SHOW TABLES LIKE 'ca_%';
+     Run the migration if tables are missing.
+
+Problem: curl resolves to Invoke-WebRequest in PowerShell
+Fix: Use curl.exe explicitly, or use Postman.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+END OF TESTING GUIDE
+================================================================================

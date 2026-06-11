@@ -68,9 +68,15 @@ ALTER TABLE ca_has_students
 -- SECTION 3: ca_question_submissions
 -- -------------------------------------------------------
 
+--     NOTE: If the pre-existing table already had a `question` column,
+--     comment out the ADD COLUMN question line below to avoid errors.
 ALTER TABLE ca_question_submissions
-    ADD COLUMN question_number TINYINT NOT NULL DEFAULT 1 AFTER student_id,
-    ADD COLUMN ai_feedback     TEXT    DEFAULT NULL       AFTER composite_score;
+    ADD COLUMN question_number TINYINT NOT NULL DEFAULT 1    AFTER student_id,
+    ADD COLUMN question        TEXT    NOT NULL DEFAULT ''   AFTER question_number,
+    ADD COLUMN ai_feedback     TEXT    DEFAULT NULL          AFTER composite_score;
+
+-- After migration, backfill question values where needed, then drop the default:
+--   ALTER TABLE ca_question_submissions ALTER COLUMN question DROP DEFAULT;
 
 -- Add FK to parent assessment (skip if already present)
 ALTER TABLE ca_question_submissions

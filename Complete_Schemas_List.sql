@@ -24,7 +24,7 @@ CREATE TABLE curiosity_assessment (
     assmt_brief      TEXT            DEFAULT NULL,
     question_count   TINYINT         NOT NULL DEFAULT 3,     -- allowed: 3 | 4 | 5 | 7 | 10
     duration_minutes SMALLINT        NOT NULL DEFAULT 15,    -- allowed: 15 | 20 | 25 | 30 | 45
-    subject_code     VARCHAR(20)     DEFAULT NULL,           -- populated when topic_source = 'db'
+    subject_code     VARCHAR(20)     DEFAULT NULL,           -- populated when topic_source = 'topic'
     document_id      INT             DEFAULT NULL,           -- FK → ca_documents.doc_id, populated when topic_source = 'document'
     rubric_relevance TINYINT         NOT NULL DEFAULT 4,     -- weight, must sum to 10 with blooms + depth
     rubric_blooms    TINYINT         NOT NULL DEFAULT 3,
