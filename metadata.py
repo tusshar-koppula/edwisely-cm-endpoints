@@ -12,6 +12,7 @@ college_subject_mapping = Table('college_subject_mapping', metadata,
     Column('subject_semester_id', Integer, nullable=False),
     Column('college_account_id', Integer, nullable=False),
     Column('subject_id', Integer, nullable=True),
+    Column('subject_code', String(20), nullable=True),
     Column('semester_id', Integer, nullable=True),
     Column('created_at', DateTime, nullable=True),
     Column('updated_at', DateTime, nullable=True)

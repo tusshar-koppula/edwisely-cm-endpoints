@@ -21,12 +21,13 @@ def handleAssessments(user):
         status       = request.args.get('status')
         subject_code = request.args.get('subject_code')
         section_id   = request.args.get('section_id')
+        q            = request.args.get('q')
         if section_id is not None:
             section_id = int(section_id)
 
         try:
             db   = get_db()
-            data = curiosity_assessment_data.getAssessments(user_id, db, metadata, status, subject_code, section_id)
+            data = curiosity_assessment_data.getAssessments(user_id, db, metadata, status, subject_code, section_id, q)
             if data is not None:
                 return jsonify({"status": 200, "message": "Successfully fetched Data", "data": data})
             else:
@@ -129,7 +130,7 @@ def getAssessmentFilters(user):
 def handleAssessment(user, assessment_id):
     user_id = user.get('user_id')
 
-    # ── DELETE — Soft delete / discard ───────────────────────────────────────
+    # ── DELETE — Soft delete ───────────────────────────────────────
     if request.method == 'DELETE':
         try:
             db   = get_db()
@@ -157,6 +158,7 @@ def handleAssessment(user, assessment_id):
 
         action = body.get('action')
 
+        #Ends assessment, changes the assessment status to ended and stops students from attempting it.
         if action == 'end':
             try:
                 db   = get_db()
@@ -334,8 +336,8 @@ def handleAssessment(user, assessment_id):
                 pass
             current_app.logger.error('/assessments/<assessment_id> - EXCEPTION: {}'.format(e))
             return jsonify({"status": 500, "message": "Failure"})
-
-
+        
+    # Overview — polled after assessment ends, displays data under the overview tab in End Assessment view.
     if view == 'overview':
         try:
             db   = get_db()
@@ -354,7 +356,8 @@ def handleAssessment(user, assessment_id):
                 pass
             current_app.logger.error('/assessments/<assessment_id> - EXCEPTION: {}'.format(e))
             return jsonify({"status": 500, "message": "Failure"})
-
+        
+    # Top questions — polled after assessment ends, displays data under the top questions tab in End Assessment view. Includes top 6 questions averaged score as per the dimension scores.
     if view == 'top_questions':
         try:
             db   = get_db()
@@ -397,7 +400,8 @@ def handleAssessment(user, assessment_id):
                 pass
             current_app.logger.error('/assessments/<assessment_id> - EXCEPTION: {}'.format(e))
             return jsonify({"status": 500, "message": "Failure"})
-
+        
+    # Export — exports assessment data in the requested format, with filters as per the columns param. Polled when user clicks the export button in End Assessment view.
     if view == 'export':
         fmt     = request.args.get('format')
         columns = request.args.getlist('columns[]')
@@ -452,7 +456,8 @@ def duplicateAssessment(user, assessment_id):
 
 
 # ── Route 3a — /assessments/<assessment_id>/students/<student_id>/stats (GET) ─
-
+# Polled when faculty clicks on a student in the Ended Students list.
+# returns that student's attempt data (questions, answers, scores, dimension breakdown, feedback etc.) for the selected assessment.
 @curiosity_assessment.route('/assessments/<int:assessment_id>/students/<int:student_id>/stats', methods=['GET'])
 @authorize
 def getStudentStats(user, assessment_id, student_id):
@@ -478,7 +483,8 @@ def getStudentStats(user, assessment_id, student_id):
 
 
 # ── Route 3b — /assessments/<assessment_id>/students/<student_id>/feedback (POST) ─
-
+#Allow faculty to send feedback to students on their assessment attempt.
+#Polled when faculty submits feedback form in the End Assessment view.
 @curiosity_assessment.route('/assessments/<int:assessment_id>/students/<int:student_id>/feedback', methods=['POST'])
 @authorize
 def sendStudentFeedback(user, assessment_id, student_id):
@@ -512,6 +518,7 @@ def sendStudentFeedback(user, assessment_id, student_id):
 
 
 # ── Route 4 — /compose-audience (GET) — audience selection filters ────────────
+#
 #
 #   filter_type access rules:
 #     sections    — faculty (own sections), hod (dept sections), principal (all)
@@ -623,7 +630,8 @@ def getComposeAudience(user):
 
 
 # ── Route 5 — /compose-syllabus (GET) — subjects list + lazy topics load ─────
-
+# loads the subjects for the dropdown in the syllabus drawer, and the topics when a subject is selected(both are separated).
+# Polled when user opens the syllabus drawer in the Create/Edit Assessment view, and when they select a subject from the dropdown in the syllabus drawer.
 @curiosity_assessment.route('/compose-syllabus', methods=['GET'])
 @authorize
 def getComposeSyllabus(user):

@@ -188,7 +188,7 @@ def getAssessmentFilters(user_id, db, metadata):
     ])
 
 
-def getAssessments(user_id, db, metadata, status=None, subject_code=None, section_id=None):
+def getAssessments(user_id, db, metadata, status=None, subject_code=None, section_id=None, q=None):
     curiosity_assessment    = metadata.tables['curiosity_assessment']
     ca_has_sections         = metadata.tables['ca_has_sections']
     ca_has_students         = metadata.tables['ca_has_students']
@@ -238,6 +238,7 @@ def getAssessments(user_id, db, metadata, status=None, subject_code=None, sectio
             )
         )
         .group_by(curiosity_assessment.c.assmt_id)
+        .order_by(curiosity_assessment.c.updated_at.desc())
     )
 
     # Optional filters
@@ -247,6 +248,8 @@ def getAssessments(user_id, db, metadata, status=None, subject_code=None, sectio
         query = query.where(curiosity_assessment.c.subject_code == subject_code)
     if section_id:
         query = query.where(ca_has_sections.c.section_id == section_id)
+    if q:
+        query = query.where(curiosity_assessment.c.assmt_title.like('%{}%'.format(q)))
 
     rows = db.execute(query).mappings().all()
     if not rows:
@@ -267,9 +270,6 @@ def getAssessments(user_id, db, metadata, status=None, subject_code=None, sectio
     sections_by_assmt = {}
     for s in section_rows:
         sections_by_assmt.setdefault(s['ca_id'], []).append(s['section_id'])
-
-    # Sort order: live → scheduled → draft → ended
-    sort_order = {'live': 0, 'scheduled': 1, 'draft': 2, 'ended': 3}
 
     assessments = []
     for row in rows:
@@ -304,7 +304,6 @@ def getAssessments(user_id, db, metadata, status=None, subject_code=None, sectio
         entry['updated_at']       = row['updated_at'].isoformat()
         assessments.append(entry)
 
-    assessments.sort(key=lambda x: sort_order.get(x['status'], 9))
     return OrderedDict([
         ('assessments', assessments),
         ('filters',     getAssessmentFilters(user_id, db, metadata))
@@ -502,13 +501,16 @@ def getTopics(user_id, db, metadata, subject_code):
     college_account_subject_college_department_section_new = metadata.tables[
         'college_account_subject_college_department_section_new']
     college_subject_mapping = metadata.tables['college_subject_mapping']
-    subject_semester_new    = metadata.tables['subject_semester_new']
-    topics                  = metadata.tables['topics']
+    subject_topic_mappings  = metadata.tables['subject_topic_mappings']
 
     query = (
         select(
-            topics.c.id.label('unit_id'),
-            topics.c.name.label('unit_name')
+            subject_topic_mappings.c.unit_id,
+            subject_topic_mappings.c.unit_name,
+            subject_topic_mappings.c.topic_id,
+            subject_topic_mappings.c.topic_name,
+            subject_topic_mappings.c.topic_code,
+            subject_topic_mappings.c.topic_type
         )
         .select_from(
             college_account_new
@@ -518,10 +520,8 @@ def getTopics(user_id, db, metadata, subject_code):
             .join(college_subject_mapping,
                 college_subject_mapping.c.id
                 == college_account_subject_college_department_section_new.c.college_subject_mapping_id)
-            .join(subject_semester_new,
-                subject_semester_new.c.id == college_subject_mapping.c.subject_semester_id)
-            .join(topics,
-                topics.c.subject_semester_id == college_subject_mapping.c.subject_semester_id)
+            .join(subject_topic_mappings,
+                subject_topic_mappings.c.college_subject_mapping_id == college_subject_mapping.c.id)
         )
         .where(
             and_(
@@ -531,22 +531,33 @@ def getTopics(user_id, db, metadata, subject_code):
             )
         )
         .distinct()
-        .order_by(topics.c.id)
+        .order_by(subject_topic_mappings.c.unit_id, subject_topic_mappings.c.topic_id)
     )
 
     rows = db.execute(query).mappings().all()
+
     if not rows:
         return None
 
+    units_dict = OrderedDict()
+    for row in rows:
+        uid = row['unit_id']
+        if uid not in units_dict:
+            units_dict[uid] = OrderedDict([
+                ('unit_id',   uid),
+                ('unit_name', row['unit_name']),
+                ('topics',    [])
+            ])
+        units_dict[uid]['topics'].append(OrderedDict([
+            ('topic_id',   row['topic_id']),
+            ('topic_name', row['topic_name']),
+            ('topic_code', row['topic_code']),
+            ('topic_type', row['topic_type'])
+        ]))
+
     return OrderedDict([
         ('subject_code', subject_code),
-        ('units', [
-            OrderedDict([
-                ('unit_id',   row['unit_id']),
-                ('unit_name', row['unit_name'])
-            ])
-            for row in rows
-        ])
+        ('units', list(units_dict.values()))
     ])
 
 
@@ -1310,6 +1321,11 @@ def getAssessmentRoster(user_id, db, metadata, assmt_id, status=None, sort=None)
     if not _checkAccess(user_id, assmt_id, db, metadata):
         return None
 
+    # Translate hyphenated frontend value to DB column value before query
+    db_status = None
+    if status and status != 'all':
+        db_status = 'not_started' if status == 'not-started' else status
+
     query = (
         select(
             ca_has_students.c.student_id,
@@ -1333,7 +1349,10 @@ def getAssessmentRoster(user_id, db, metadata, assmt_id, status=None, sort=None)
             .join(curiosity_assessment,
                 curiosity_assessment.c.assmt_id == ca_has_students.c.ca_id)
         )
-        .where(ca_has_students.c.ca_id == assmt_id)
+        .where(and_(
+            ca_has_students.c.ca_id == assmt_id,
+            *([ca_has_students.c.status == db_status] if db_status else [])
+        ))
         .group_by(
             ca_has_students.c.student_id,
             ca_has_students.c.status,
@@ -1342,11 +1361,6 @@ def getAssessmentRoster(user_id, db, metadata, assmt_id, status=None, sort=None)
             curiosity_assessment.c.question_count
         )
     )
-
-    if status and status != 'all':
-        status_map = {'not-started': 'not_started'}
-        db_status = status_map.get(status, status)
-        query = query.where(ca_has_students.c.status == db_status)
 
     sort_map = {
         'score-desc': func.avg(ca_question_submissions.c.composite_score).desc(),
@@ -1498,11 +1512,9 @@ def getAssessmentDocument(user_id, db, metadata, assmt_id, created_by=None):
 
 
 def getAssessmentTopics(user_id, db, metadata, assmt_id, created_by=None):
-    curiosity_assessment = metadata.tables['curiosity_assessment']
-    ca_has_topics        = metadata.tables['ca_has_topics']
-    topics               = metadata.tables['topics']           # unit table
-    subject_semester_new = metadata.tables['subject_semester_new']
-    subject_master       = metadata.tables['subject_master']
+    curiosity_assessment   = metadata.tables['curiosity_assessment']
+    ca_has_topics          = metadata.tables['ca_has_topics']
+    subject_topic_mappings = metadata.tables['subject_topic_mappings']
 
     if not _checkAccess(user_id, assmt_id, db, metadata, created_by=created_by):
         return None
@@ -1515,41 +1527,42 @@ def getAssessmentTopics(user_id, db, metadata, assmt_id, created_by=None):
     if not assmt:
         return None
 
-    rows = db.execute(
+    query = (
         select(
-            topics.c.id.label('unit_id'),
-            topics.c.name.label('unit_name'),
-            ca_has_topics.c.topic_id,
-            subject_master.c.name.label('subject_name'),
-            subject_master.c.id.label('subject_master_id')
+            subject_topic_mappings.c.unit_id,
+            subject_topic_mappings.c.unit_name,
+            subject_topic_mappings.c.topic_id,
+            subject_topic_mappings.c.topic_name,
+            subject_topic_mappings.c.topic_code
         )
         .select_from(
             ca_has_topics
-            .join(topics, topics.c.id == ca_has_topics.c.topic_id)
-            .join(subject_semester_new,
-                subject_semester_new.c.id == topics.c.subject_semester_id)
-            .join(subject_master,
-                subject_master.c.id == subject_semester_new.c.subject_master_id)
+            .join(subject_topic_mappings,
+                subject_topic_mappings.c.topic_id == ca_has_topics.c.topic_id)
         )
         .where(ca_has_topics.c.ca_id == assmt_id)
-        .order_by(topics.c.id)
-    ).mappings().all()
+        .order_by(subject_topic_mappings.c.unit_id, subject_topic_mappings.c.topic_id)
+    )
+
+    rows = db.execute(query).mappings().all()
 
     if not rows:
         return None
 
-    # Group by unit
     units_dict = OrderedDict()
     for row in rows:
         uid = row['unit_id']
         if uid not in units_dict:
-            units_dict[uid] = {
-                'unit_id':      uid,
-                'unit_name':    row['unit_name'],
-                'subject_name': row['subject_name'],
-                'topic_ids':    []
-            }
-        units_dict[uid]['topic_ids'].append(row['topic_id'])
+            units_dict[uid] = OrderedDict([
+                ('unit_id',   uid),
+                ('unit_name', row['unit_name']),
+                ('topics',    [])
+            ])
+        units_dict[uid]['topics'].append(OrderedDict([
+            ('topic_id',   row['topic_id']),
+            ('topic_name', row['topic_name']),
+            ('topic_code', row['topic_code'])
+        ]))
 
     return OrderedDict([
         ('subject_code', assmt['subject_code']),
@@ -1605,6 +1618,28 @@ def sendStudentFeedback(user_id, db, metadata, assmt_id, student_id, message_tex
         ('feedback_id', result.lastrowid),
         ('sent_at',     sent_at.isoformat())
     ])
+
+
+def discardAssessment(user_id, db, metadata, assmt_id):
+    curiosity_assessment = metadata.tables['curiosity_assessment']
+
+    if not _checkAccess(user_id, assmt_id, db, metadata):
+        return None
+
+    assmt = db.execute(
+        select(curiosity_assessment.c.status)
+        .where(
+            and_(
+                curiosity_assessment.c.assmt_id == assmt_id,
+                curiosity_assessment.c.is_deleted == 0
+            )
+        )
+    ).mappings().first()
+
+    if not assmt or assmt['status'] not in ('draft', 'scheduled'):
+        return None
+
+    return _fetchAssessmentById(assmt_id, db, metadata)
 
 
 def endAssessment(user_id, db, metadata, assmt_id):
