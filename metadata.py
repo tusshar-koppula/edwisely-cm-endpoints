@@ -122,15 +122,20 @@ curiosity_assessment = Table('curiosity_assessment', metadata,
     Column('duration_minutes', SmallInteger, nullable=False, default=15),
     Column('subject_code', String(20), nullable=True),
     Column('document_id', Integer, ForeignKey('ca_documents.doc_id'), nullable=True),
-    Column('rubric_relevance', SmallInteger, nullable=False, default=4),
-    Column('rubric_blooms', SmallInteger, nullable=False, default=3),
-    Column('rubric_depth', SmallInteger, nullable=False, default=3),
+    Column('rubric_relevance_limit', SmallInteger, nullable=False, default=4),
+    Column('rubric_blooms_limit', SmallInteger, nullable=False, default=3),
+    Column('rubric_depth_limit', SmallInteger, nullable=False, default=3),
+    Column('avg_r_score', DECIMAL(5, 2), nullable=True),
+    Column('avg_b_score', DECIMAL(3, 2), nullable=True),
+    Column('avg_d_score', DECIMAL(3, 2), nullable=True),
+    Column('avg_composite_score', DECIMAL(5, 2), nullable=True),
     Column('status', Enum('draft', 'scheduled', 'live', 'ended'), nullable=False, default='draft'),
     Column('start_time', DateTime, nullable=True),
     Column('end_time', DateTime, nullable=True),
-    Column('is_deleted', SmallInteger, nullable=False, default=0),
     Column('created_at', DateTime, nullable=False),
-    Column('updated_at', DateTime, nullable=False)
+    Column('updated_at', DateTime, nullable=False),
+    Column('median_time_seconds', Integer, nullable=True),
+    Column('is_deleted', SmallInteger, nullable=False, default=0)
 )
 
 ca_has_topics = Table('ca_has_topics', metadata,
@@ -147,6 +152,10 @@ ca_has_students = Table('ca_has_students', metadata,
     Column('ca_id', Integer, ForeignKey('curiosity_assessment.assmt_id', ondelete='CASCADE'), nullable=False, primary_key=True),
     Column('student_id', Integer, nullable=False, primary_key=True),
     Column('status', Enum('not_started', 'writing', 'submitted'), nullable=False, default='not_started'),
+    Column('avg_r_score', DECIMAL(5, 2), nullable=True),
+    Column('avg_b_score', DECIMAL(3, 2), nullable=True),
+    Column('avg_d_score', DECIMAL(3, 2), nullable=True),
+    Column('avg_composite_score', DECIMAL(5, 2), nullable=True),
     Column('submitted_at', DateTime, nullable=True),
     Column('time_elapsed_seconds', Integer, nullable=True),
     Column('added_at', DateTime, nullable=False)
@@ -183,4 +192,10 @@ ca_share = Table('ca_share', metadata,
     Column('created_by', Integer, nullable=False),
     Column('created_at', DateTime, nullable=False),
     Column('updated_at', DateTime, nullable=False)
+)
+
+ca_similar_questions = Table('ca_similar_questions', metadata,
+    Column('id', Integer, primary_key=True, autoincrement=True),
+    Column('source_q_id', Integer, nullable=False),
+    Column('question', Text, nullable=False)
 )
