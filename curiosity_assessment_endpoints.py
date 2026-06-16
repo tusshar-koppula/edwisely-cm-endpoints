@@ -24,7 +24,10 @@ def getCuriosityAssessmentsList(user):
         section_id   = request.args.get('section_id')
         q            = request.args.get('q')
         if section_id is not None:
-            section_id = int(section_id)
+            try:
+                section_id = int(section_id)
+            except ValueError:
+                return jsonify({"status": 422, "message": "section_id must be an integer"})
 
         try:
             db   = get_db()
@@ -172,8 +175,11 @@ def createOrUpdateAssessment(user):
         if not duration_minutes: return jsonify({"status": 422, "message": "duration_minutes is missing"})
         if not rubric:           return jsonify({"status": 422, "message": "rubric is missing"})
 
-        question_count   = int(question_count)
-        duration_minutes = int(duration_minutes)
+        try:
+            question_count   = int(question_count)
+            duration_minutes = int(duration_minutes)
+        except ValueError:
+            return jsonify({"status": 422, "message": "question_count and duration_minutes must be integers"})
 
         try:
             db = get_db()
@@ -208,7 +214,10 @@ def createOrUpdateAssessment(user):
         assessment_id_raw = request.form.get('assessment_id')
         if not assessment_id_raw:
             return jsonify({"status": 422, "message": "assessment_id is missing"})
-        assessment_id = int(assessment_id_raw)
+        try:
+            assessment_id = int(assessment_id_raw)
+        except ValueError:
+            return jsonify({"status": 422, "message": "assessment_id must be an integer"})
 
         title            = request.form.get('title')
         description      = request.form.get('description')
@@ -227,8 +236,11 @@ def createOrUpdateAssessment(user):
         recipients = json.loads(recipients_raw) if recipients_raw else None
         rubric     = json.loads(rubric_raw)     if rubric_raw     else None
 
-        question_count   = int(question_count)   if question_count   else None
-        duration_minutes = int(duration_minutes) if duration_minutes else None
+        try:
+            question_count   = int(question_count)   if question_count   else None
+            duration_minutes = int(duration_minutes) if duration_minutes else None
+        except ValueError:
+            return jsonify({"status": 422, "message": "question_count and duration_minutes must be integers"})
 
         try:
             db = get_db()
@@ -270,7 +282,10 @@ def deleteAssessment(user):
     assessment_id = body.get('assessment_id')
     if not assessment_id:
         return jsonify({"status": 422, "message": "assessment_id is missing"})
-    assessment_id = int(assessment_id)
+    try:
+        assessment_id = int(assessment_id)
+    except ValueError:
+        return jsonify({"status": 422, "message": "assessment_id must be an integer"})
     if request.method == 'PATCH':
         try:
             db   = get_db()
@@ -303,7 +318,10 @@ def duplicateAssessment(user):
     assessment_id = body.get('assessment_id')
     if not assessment_id:
         return jsonify({"status": 422, "message": "assessment_id is missing"})
-    assessment_id = int(assessment_id)
+    try:
+        assessment_id = int(assessment_id)
+    except ValueError:
+        return jsonify({"status": 422, "message": "assessment_id must be an integer"})
 
     try:
         db   = get_db()
@@ -331,7 +349,10 @@ def endCuriosityAssessment(user):
     assessment_id = request.args.get('assessment_id')
     if not assessment_id:
         return jsonify({"status": 422, "message": "assessment_id is missing"})
-    assessment_id = int(assessment_id)
+    try:
+        assessment_id = int(assessment_id)
+    except ValueError:
+        return jsonify({"status": 422, "message": "assessment_id must be an integer"})
     try:
         db   = get_db()
         data = curiosity_assessment_data.endAssessment(user_id, db, metadata, assessment_id)
@@ -358,7 +379,10 @@ def getAssessmentStats(user):
     assessment_id = request.args.get('assessment_id')
     if not assessment_id:
         return jsonify({"status": 422, "message": "assessment_id is missing"})
-    assessment_id = int(assessment_id)
+    try:
+        assessment_id = int(assessment_id)
+    except ValueError:
+        return jsonify({"status": 422, "message": "assessment_id must be an integer"})
     score_band    = request.args.get('score_band')
     status_filter = request.args.get('status')
     try:
@@ -387,7 +411,10 @@ def getAssessmentScorebands(user):
     assessment_id = request.args.get('assessment_id')
     if not assessment_id:
         return jsonify({"status": 422, "message": "assessment_id is missing"})
-    assessment_id = int(assessment_id)
+    try:
+        assessment_id = int(assessment_id)
+    except ValueError:
+        return jsonify({"status": 422, "message": "assessment_id must be an integer"})
     try:
         db   = get_db()
         data = curiosity_assessment_data.getAssessmentScorebands(user_id, db, metadata, assessment_id)
@@ -420,8 +447,11 @@ def getStudentStats(user):
         return jsonify({"status": 422, "message": "assessment_id is missing"})
     if not student_id:
         return jsonify({"status": 422, "message": "student_id is missing"})
-    assessment_id = int(assessment_id)
-    student_id    = int(student_id)
+    try:
+        assessment_id = int(assessment_id)
+        student_id    = int(student_id)
+    except ValueError:
+        return jsonify({"status": 422, "message": "assessment_id and student_id must be integers"})
 
     try:
         db   = get_db()
@@ -459,8 +489,11 @@ def sendStudentFeedback(user):
         return jsonify({"status": 422, "message": "student_id is missing"})
     if not message:
         return jsonify({"status": 422, "message": "message is missing"})
-    assessment_id = int(assessment_id)
-    student_id    = int(student_id)
+    try:
+        assessment_id = int(assessment_id)
+        student_id    = int(student_id)
+    except ValueError:
+        return jsonify({"status": 422, "message": "assessment_id and student_id must be integers"})
 
     try:
         db   = get_db()
@@ -570,7 +603,10 @@ def getCuriosityAssessmentsExaminees(user):
         section_id = request.args.get('section_id')
         q          = request.args.get('q')
         if section_id is not None:
-            section_id = int(section_id)
+            try:
+                section_id = int(section_id)
+            except ValueError:
+                return jsonify({"status": 422, "message": "section_id must be an integer"})
 
         try:
             db   = get_db()
@@ -656,7 +692,10 @@ def getTopQuestions(user):
     assessment_id = request.args.get('assessment_id')
     if not assessment_id:
         return jsonify({"status": 422, "message": "assessment_id is missing"})
-    assessment_id = int(assessment_id)
+    try:
+        assessment_id = int(assessment_id)
+    except ValueError:
+        return jsonify({"status": 422, "message": "assessment_id must be an integer"})
     try:
         db   = get_db()
         data = curiosity_assessment_data.getTopQuestions(user_id, db, metadata, assessment_id)
@@ -675,15 +714,6 @@ def getTopQuestions(user):
         current_app.logger.error('/assessments/<assessment_id> - EXCEPTION: {}'.format(e))
         return jsonify({"status": 500, "message": "Failure"})
 
-@curiosity_assessment.route('/getCuriosityAssessmentsScoreBands', methods=['GET'])
-@authorize
-def getCuriosityAssessmentScoreBands(user):
-    user_id = user.get('user_id')
-    assessment_id = request.args.get('assessment_id')
-    if not assessment_id:
-        return jsonify({"status": 422, "message": "assessment_id is missing"})
-    assessment_id = int(assessment_id)
-
 
 @curiosity_assessment.route('/exportCuriosityAssessmentsResults', methods=['GET'])
 @authorize
@@ -692,7 +722,10 @@ def exportCuriosityAssessmentResults(user):
     assessment_id = request.args.get('assessment_id')
     if not assessment_id:
         return jsonify({"status": 422, "message": "assessment_id is missing"})
-    assessment_id = int(assessment_id)
+    try:
+        assessment_id = int(assessment_id)
+    except ValueError:
+        return jsonify({"status": 422, "message": "assessment_id must be an integer"})
     fmt     = request.args.get('format')
     columns = request.args.getlist('columns[]')
 
@@ -724,7 +757,10 @@ def shareAssessmentResults(user):
     assessment_id = request.args.get('assessment_id')
     if not assessment_id:
         return jsonify({"status": 422, "message": "assessment_id is missing"})
-    assessment_id = int(assessment_id)
+    try:
+        assessment_id = int(assessment_id)
+    except ValueError:
+        return jsonify({"status": 422, "message": "assessment_id must be an integer"})
     body = request.get_json()
     if not body:
         return jsonify({"status": 422, "message": "Request body is missing"})
