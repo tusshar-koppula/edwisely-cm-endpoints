@@ -200,6 +200,7 @@ CREATE TABLE ca_documents (
     name        VARCHAR(255) NOT NULL,
     size_bytes  INT          NOT NULL,
     pages       SMALLINT     NOT NULL,
+    s3_key      VARCHAR(512) NOT NULL,
     storage_url TEXT         NOT NULL,
     uploaded_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (doc_id)
@@ -312,8 +313,8 @@ INSERT INTO student_section_mapping (id, student_id, section_id) VALUES
 (3, 203, 2), (4, 204, 2);
 
 -- Document (for document-mode assessment)
-INSERT INTO ca_documents (doc_id, uploaded_by, name, size_bytes, pages, storage_url, uploaded_at) VALUES
-(1, 101, 'DSA_Notes_Unit1.pdf', 204800, 12, '/uploads/ca_documents/DSA_Notes_Unit1.pdf', '2026-06-01 10:00:00');
+INSERT INTO ca_documents (doc_id, uploaded_by, name, size_bytes, pages, s3_key, storage_url, uploaded_at) VALUES
+(1, 101, 'DSA_Notes_Unit1.pdf', 204800, 12, 'ca_documents/101/seed__DSA_Notes_Unit1.pdf', 'https://edwisely-ca.s3.ap-south-1.amazonaws.com/ca_documents/101/seed__DSA_Notes_Unit1.pdf', '2026-06-01 10:00:00');
 
 -- ── Assessment 1: DRAFT ───────────────────────────────────────
 INSERT INTO curiosity_assessment

@@ -20,9 +20,9 @@ def getCuriosityAssessmentsList(user):
     # ── GET — Library list ────────────────────────────────────────────────────
     if request.method == 'GET':
         status       = request.args.get('status')
-        subject_code = request.args.get('subject_code')
+        subject_code = request.args.get('subject_code') #csm_id 
         section_id   = request.args.get('section_id')
-        q            = request.args.get('q')
+        q            = request.args.get('q') #for search term
         if section_id is not None:
             try:
                 section_id = int(section_id)
@@ -42,7 +42,7 @@ def getCuriosityAssessmentsList(user):
             except Exception:
                 pass
             current_app.logger.error('/getCuriosityAssessmentsList - EXCEPTION: {}'.format(e))
-            return jsonify({"status": 500, "message": "Failure"})
+            return jsonify({"status": 500, "message": str(e)})
 
 
 # ── Route — /getCuriosityAssessmentsFilters (GET) ────────────────────────────────────
@@ -68,7 +68,7 @@ def getAssessmentFilters(user):
         except Exception:
             pass
         current_app.logger.error('/getCuriosityAssessmentsFilters - EXCEPTION: {}'.format(e))
-        return jsonify({"status": 500, "message": "Failure"})
+        return jsonify({"status": 500, "message": str(e)})
 
 @curiosity_assessment.route('/getCuriosityAssessmentsbyID', methods=['GET']) # get Assessment By ID
 @authorize
@@ -102,7 +102,7 @@ def getAssessmentByID(user):
         except Exception:
             pass
         current_app.logger.error('/getCuriosityAssessmentsbyID - EXCEPTION: {}'.format(e))
-        return jsonify({"status": 500, "message": "Failure"})
+        return jsonify({"status": 500, "message": str(e)})
 
 
 # ── Route — /getCuriosityAssessmentsSimilarQuestions (GET) ───────────────────────────────────────
@@ -135,20 +135,37 @@ def getCuriosityAssessmentsSimilarQuestions(user):
         except Exception:
             pass
         current_app.logger.error('/getCuriosityAssessmentsSimilarQuestions - EXCEPTION: {}'.format(e))
-        return jsonify({"status": 500, "message": "Failure"})
+        return jsonify({"status": 500, "message": str(e)})
 
 
-# ── Route 2 — /createOrUpdateCuriosityAssessments/<int:assessment_id> (POST, PATCH) ──────────────
+# ── Route 2 — /createOrUpdateCuriosityAssessments (POST, PATCH) ──────────────────────────────────
 
 @curiosity_assessment.route('/createOrUpdateCuriosityAssessments', methods=['POST', 'PATCH']) # create or update Assessment
 @authorize
 def createOrUpdateAssessment(user):
-    user_id = user.get('user_id')
+    user_id     = user.get('user_id')
+    source_kind = request.form.get('source_kind')
+
+    # ── Shared — db connection + document upload (runs before POST/PATCH split) ─
+    try:
+        db          = get_db()
+        document_id = None
+        if request.files.get('file'):
+            upload_result = curiosity_assessment_data.uploadDocument(user_id, db, metadata, request.files.get('file'))
+            document_id   = upload_result['document_id']
+    except Exception as e:
+        subject = "server:- {}, Error in /createOrUpdateCuriosityAssessments".format(os.environ.get('FLASK_ENV'))
+        try:
+            sg_client = SendGridAPIClient(os.environ.get('SENDGRID_API_KEY'))
+            sg_client.send(Mail(from_email='noreply@edwisely.com', to_emails='alerts@edwisely.com', subject=subject, plain_text_content=str(e)))
+        except Exception:
+            pass
+        current_app.logger.error('/createOrUpdateCuriosityAssessments - EXCEPTION: {}'.format(e))
+        return jsonify({"status": 500, "message": str(e)})
 
     if request.method == 'POST':
         # ── POST — Create assessment ──────────────────────────────────────────────
         title            = request.form.get('title')
-        source_kind      = request.form.get('source_kind')
         topic_ids_raw    = request.form.get('topic_ids')
         recipients_raw   = request.form.get('recipients')
         question_count   = request.form.get('question_count')
@@ -164,30 +181,31 @@ def createOrUpdateAssessment(user):
         recipients = json.loads(recipients_raw) if recipients_raw else None
         rubric     = json.loads(rubric_raw)     if rubric_raw     else None
 
-        if not title:            return jsonify({"status": 422, "message": "title is missing"})
-        if not source_kind:      return jsonify({"status": 422, "message": "source_kind is missing"})
-        if source_kind == 'document' and not request.files.get('file'):
-            return jsonify({"status": 422, "message": "file is required when source_kind is document"})
-        if source_kind == 'topic' and not topic_ids:
-            return jsonify({"status": 422, "message": "topic_ids is required when source_kind is topic"})
-        if not recipients:       return jsonify({"status": 422, "message": "recipients is missing"})
-        if not question_count:   return jsonify({"status": 422, "message": "question_count is missing"})
-        if not duration_minutes: return jsonify({"status": 422, "message": "duration_minutes is missing"})
-        if not rubric:           return jsonify({"status": 422, "message": "rubric is missing"})
+        if not title:
+            return jsonify({"status": 422, "message": "title is missing"})
+
+        if status in ('live', 'scheduled'):
+            missing = []
+            if not source_kind:                               missing.append('source_kind')
+            if source_kind == 'document' and not document_id: missing.append('file')
+            if source_kind == 'topic'    and not topic_ids:  missing.append('topic_ids')
+            if source_kind == 'topic'    and not subject_code: missing.append('subject_code')
+            if not recipients:                                missing.append('recipients')
+            if not question_count:                            missing.append('question_count')
+            if not duration_minutes:                          missing.append('duration_minutes')
+            if not rubric:                                    missing.append('rubric')
+            if missing:
+                return jsonify({"status": 422, "message": "Missing required fields for {} status: {}".format(status, ', '.join(missing))})
+        else:
+            status = 'draft'
 
         try:
-            question_count   = int(question_count)
-            duration_minutes = int(duration_minutes)
+            question_count   = int(question_count)   if question_count   else None
+            duration_minutes = int(duration_minutes) if duration_minutes else None
         except ValueError:
             return jsonify({"status": 422, "message": "question_count and duration_minutes must be integers"})
 
         try:
-            db = get_db()
-            document_id = None
-            if source_kind == 'document':
-                upload_result = curiosity_assessment_data.uploadDocument(user_id, db, metadata, request.files.get('file'))
-                document_id = upload_result['document_id']
-
             data = curiosity_assessment_data.createAssessment(
                 user_id, db, metadata,
                 title, description, source_kind, document_id, topic_ids,
@@ -199,6 +217,8 @@ def createOrUpdateAssessment(user):
             else:
                 return jsonify({"status": 400, "message": "No Data Found!!"})
 
+        except ValueError as ve:
+            return jsonify({"status": 422, "message": str(ve)})
         except Exception as e:
             subject = "server:- {}, Error in /createOrUpdateCuriosityAssessments POST".format(os.environ.get('FLASK_ENV'))
             try:
@@ -207,7 +227,7 @@ def createOrUpdateAssessment(user):
             except Exception:
                 pass
             current_app.logger.error('/createOrUpdateCuriosityAssessments POST - EXCEPTION: {}'.format(e))
-            return jsonify({"status": 500, "message": "Failure"})
+            return jsonify({"status": 500, "message": str(e)})
 
     # ── PATCH — Update ─────────────────────────────────────────
     if request.method == 'PATCH':
@@ -221,7 +241,6 @@ def createOrUpdateAssessment(user):
 
         title            = request.form.get('title')
         description      = request.form.get('description')
-        source_kind      = request.form.get('source_kind')
         topic_ids_raw    = request.form.get('topic_ids')
         recipients_raw   = request.form.get('recipients')
         subject_code     = request.form.get('subject_code')
@@ -243,12 +262,6 @@ def createOrUpdateAssessment(user):
             return jsonify({"status": 422, "message": "question_count and duration_minutes must be integers"})
 
         try:
-            db = get_db()
-            document_id = None
-            if request.files.get('file'):
-                upload_result = curiosity_assessment_data.uploadDocument(user_id, db, metadata, request.files.get('file'))
-                document_id = upload_result['document_id']
-
             data = curiosity_assessment_data.updateAssessment(
                 user_id, db, metadata, assessment_id,
                 title, description, source_kind, document_id, topic_ids,
@@ -260,6 +273,8 @@ def createOrUpdateAssessment(user):
             else:
                 return jsonify({"status": 400, "message": "No Data Found!!"})
 
+        except ValueError as ve:
+            return jsonify({"status": 422, "message": str(ve)})
         except Exception as e:
             subject = "server:- {}, Error in /createOrUpdateCuriosityAssessments PATCH".format(os.environ.get('FLASK_ENV'))
             try:
@@ -268,7 +283,7 @@ def createOrUpdateAssessment(user):
             except Exception:
                 pass
             current_app.logger.error('/createOrUpdateCuriosityAssessments PATCH - EXCEPTION: {}'.format(e))
-            return jsonify({"status": 500, "message": "Failure"})
+            return jsonify({"status": 500, "message": str(e)})
 
 
 @curiosity_assessment.route('/deleteCuriosityAssessments', methods=['PATCH']) # deleteAssessment
@@ -303,7 +318,7 @@ def deleteAssessment(user):
             except Exception:
                 pass
             current_app.logger.error('/deleteCuriosityAssessments/<int:assessment_id> - EXCEPTION: {}'.format(e))
-            return jsonify({"status": 500, "message": "Failure"})
+            return jsonify({"status": 500, "message": str(e)})
 
 
 # ── Route 3 (duplicate) — /assessments/<assessment_id>/duplicate (POST) ─────
@@ -339,7 +354,7 @@ def duplicateAssessment(user):
         except Exception:
             pass
         current_app.logger.error('/assessments/<assessment_id>/duplicate - EXCEPTION: {}'.format(e))
-        return jsonify({"status": 500, "message": "Failure"})
+        return jsonify({"status": 500, "message": str(e)})
 
 
 @curiosity_assessment.route('/endCuriosityAssessments', methods=['PATCH']) # end a Curiosity Assessment
@@ -369,7 +384,7 @@ def endCuriosityAssessment(user):
         except Exception:
             pass
         current_app.logger.error('/assessments/<assessment_id> - EXCEPTION: {}'.format(e))
-        return jsonify({"status": 500, "message": "Failure"})
+        return jsonify({"status": 500, "message": str(e)})
 
 
 @curiosity_assessment.route('/getCuriosityAssessmentsStats', methods=['GET']) # get assessment stats for Live Monitoring dashboard
@@ -383,11 +398,10 @@ def getAssessmentStats(user):
         assessment_id = int(assessment_id)
     except ValueError:
         return jsonify({"status": 422, "message": "assessment_id must be an integer"})
-    score_band    = request.args.get('score_band')
-    status_filter = request.args.get('status')
+    sort = request.args.get('sort')
     try:
         db   = get_db()
-        data = curiosity_assessment_data.getAssessmentStats(user_id, db, metadata, assessment_id, score_band, status_filter)
+        data = curiosity_assessment_data.getAssessmentStats(user_id, db, metadata, assessment_id, sort)
         if data:
             return jsonify({"status": 200, "message": "Successfully fetched Data", "data": data})
         else:
@@ -401,7 +415,7 @@ def getAssessmentStats(user):
         except Exception:
             pass
         current_app.logger.error('/getCuriosityAssessmentsStats - EXCEPTION: {}'.format(e))
-        return jsonify({"status": 500, "message": "Failure"})
+        return jsonify({"status": 500, "message": str(e)})
 
 
 @curiosity_assessment.route('/getCuriosityAssessmentsScorebands', methods=['GET'])
@@ -431,7 +445,7 @@ def getAssessmentScorebands(user):
         except Exception:
             pass
         current_app.logger.error('/getCuriosityAssessmentsScorebands - EXCEPTION: {}'.format(e))
-        return jsonify({"status": 500, "message": "Failure"})
+        return jsonify({"status": 500, "message": str(e)})
 
 
 # ── Route 3a — /assessments/<assessment_id>/students/<student_id>/stats (GET) ─
@@ -469,7 +483,7 @@ def getStudentStats(user):
         except Exception:
             pass
         current_app.logger.error('/getCuriosityAssessmentsStudentSubmissionStats - EXCEPTION: {}'.format(e))
-        return jsonify({"status": 500, "message": "Failure"})
+        return jsonify({"status": 500, "message": str(e)})
 
 
 # ── Route 3b — /sendCuriosityAssessmentsFeedback/<int:assessment_id>/students/<int:student_id> (POST) ─
@@ -511,7 +525,7 @@ def sendStudentFeedback(user):
         except Exception:
             pass
         current_app.logger.error('/sendCuriosityAssessmentsStudentFeedback/<int:assessment_id>/students/<int:student_id> - EXCEPTION: {}'.format(e))
-        return jsonify({"status": 500, "message": "Failure"})
+        return jsonify({"status": 500, "message": str(e)})
 
 
 # ── Route 4 — /composeCuriosityAssessmentsExaminees (GET) — audience selection filters ────────────
@@ -551,7 +565,7 @@ def getCuriosityAssessmentsExaminees(user):
             except Exception:
                 pass
             current_app.logger.error('/composeCuriosityAssessmentsExaminees - EXCEPTION: {}'.format(e))
-            return jsonify({"status": 500, "message": "Failure"})
+            return jsonify({"status": 500, "message": str(e)})
 
     if filter_type == 'semesters':
         if role == 'faculty':
@@ -575,7 +589,7 @@ def getCuriosityAssessmentsExaminees(user):
             except Exception:
                 pass
             current_app.logger.error('/composeCuriosityAssessmentsExaminees - EXCEPTION: {}'.format(e))
-            return jsonify({"status": 500, "message": "Failure"})
+            return jsonify({"status": 500, "message": str(e)})
 
     if filter_type == 'departments':
         if role != 'principal':
@@ -597,7 +611,7 @@ def getCuriosityAssessmentsExaminees(user):
             except Exception:
                 pass
             current_app.logger.error('/composeCuriosityAssessmentsExaminees - EXCEPTION: {}'.format(e))
-            return jsonify({"status": 500, "message": "Failure"})
+            return jsonify({"status": 500, "message": str(e)})
 
     if filter_type == 'students':
         section_id = request.args.get('section_id')
@@ -624,7 +638,7 @@ def getCuriosityAssessmentsExaminees(user):
             except Exception:
                 pass
             current_app.logger.error('/composeCuriosityAssessmentsExaminees - EXCEPTION: {}'.format(e))
-            return jsonify({"status": 500, "message": "Failure"})
+            return jsonify({"status": 500, "message": str(e)})
 
     return jsonify({"status": 422, "message": "unrecognised filter_type param"})
 
@@ -658,7 +672,7 @@ def getComposeSyllabus(user):
             except Exception:
                 pass
             current_app.logger.error('/composeCuriosityAssessmentsSyllabus - EXCEPTION: {}'.format(e))
-            return jsonify({"status": 500, "message": "Failure"})
+            return jsonify({"status": 500, "message": str(e)})
 
     if type_ == 'topics':
         subject_code = request.args.get('subject_code')
@@ -681,7 +695,7 @@ def getComposeSyllabus(user):
             except Exception:
                 pass
             current_app.logger.error('/composeCuriosityAssessmentsSyllabus - EXCEPTION: {}'.format(e))
-            return jsonify({"status": 500, "message": "Failure"})
+            return jsonify({"status": 500, "message": str(e)})
 
     return jsonify({"status": 422, "message": "unrecognised type param"})
 
@@ -690,6 +704,11 @@ def getComposeSyllabus(user):
 def getTopQuestions(user):
     user_id = user.get('user_id')
     assessment_id = request.args.get('assessment_id')
+    # limit = request.args.get('limit', 6) # default to top 6 questions
+    # try:
+    #     limit = int(limit)
+    # except ValueError:
+    #     return jsonify({"status": 422, "message": "limit must be an integer"})
     if not assessment_id:
         return jsonify({"status": 422, "message": "assessment_id is missing"})
     try:
@@ -712,7 +731,7 @@ def getTopQuestions(user):
         except Exception:
             pass
         current_app.logger.error('/assessments/<assessment_id> - EXCEPTION: {}'.format(e))
-        return jsonify({"status": 500, "message": "Failure"})
+        return jsonify({"status": 500, "message": str(e)})
 
 
 @curiosity_assessment.route('/exportCuriosityAssessmentsResults', methods=['GET'])
@@ -747,7 +766,7 @@ def exportCuriosityAssessmentResults(user):
         except Exception:
             pass
         current_app.logger.error('/assessments/<assessment_id> - EXCEPTION: {}'.format(e))
-        return jsonify({"status": 500, "message": "Failure"})
+        return jsonify({"status": 500, "message": str(e)})
 
 
 @curiosity_assessment.route('/shareCuriosityAssessmentsResults', methods=['POST'])
@@ -785,4 +804,4 @@ def shareAssessmentResults(user):
         except Exception:
             pass
         current_app.logger.error('/shareCuriosityAssessmentsResults - EXCEPTION: {}'.format(e))
-        return jsonify({"status": 500, "message": "Failure"})
+        return jsonify({"status": 500, "message": str(e)})

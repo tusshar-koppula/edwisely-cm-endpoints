@@ -4,3 +4,5 @@ pymysql
 cryptography
 python-dotenv
 sendgrid
+boto3
+pypdf

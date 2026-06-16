@@ -4,6 +4,18 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import os
+import uuid
+import io
+import boto3
+from pypdf import PdfReader
+
+_s3 = boto3.client(
+    's3',
+    region_name          = os.environ.get('AWS_REGION'),
+    aws_access_key_id    = os.environ.get('AWS_ACCESS_KEY_ID'),
+    aws_secret_access_key= os.environ.get('AWS_SECRET_ACCESS_KEY')
+)
+_S3_BUCKET = os.environ.get('S3_BUCKET_NAME')
 
 
 # ============================================================
@@ -279,7 +291,7 @@ def getAssessments(user_id, db, metadata, status=None, subject_code=None, sectio
         entry['description']      = row['assmt_brief']
         entry['source_kind']      = row['topic_source']
         entry['subject_code']     = row['subject_code']
-        entry['document_id']      = row['document_id']
+        entry['document_id']      = row['document_id'] # document need to also come in this api, topic count key is missing, subject name
         entry['question_count']   = row['question_count']
         entry['duration_minutes'] = row['duration_minutes']
         entry['rubric']           = {
@@ -305,10 +317,10 @@ def getAssessments(user_id, db, metadata, status=None, subject_code=None, sectio
     ])
 
 
-def deleteAssessment(user_id, db, metadata, assmt_id):
+def deleteAssessment(user_id, db, metadata, assmt_id): 
     curiosity_assessment = metadata.tables['curiosity_assessment']
 
-    if not _checkAccess(user_id, assmt_id, db, metadata):
+    if not _checkAccess(user_id, assmt_id, db, metadata): # change the logic to have the access for the faculty who created it
         return None
 
     check = db.execute(
@@ -932,12 +944,18 @@ def uploadDocument(user_id, db, metadata, file):
     file_bytes = file.read()
     size_bytes = len(file_bytes)
 
-    # Count PDF pages via byte marker — replace with pypdf in production
-    pages = file_bytes.count(b'/Page ')
-    pages = pages if pages > 0 else 1
+    pages  = len(PdfReader(io.BytesIO(file_bytes)).pages)
+    s3_key = 'ca_documents/{}/{}__{}'.format(user_id, uuid.uuid4().hex, filename)
 
-    # Store file — replace with actual S3 / storage call in production
-    storage_url = '/uploads/ca_documents/{}'.format(filename)
+    _s3.upload_fileobj(
+        io.BytesIO(file_bytes),
+        _S3_BUCKET,
+        s3_key,
+        ExtraArgs={'ACL': 'public-read', 'ContentType': 'application/pdf'}
+    )
+    storage_url = 'https://{}.s3.{}.amazonaws.com/{}'.format(
+        _S3_BUCKET, os.environ.get('AWS_REGION'), s3_key
+    )
 
     result = db.execute(
         ca_documents.insert().values(
@@ -945,14 +963,14 @@ def uploadDocument(user_id, db, metadata, file):
             name        = filename,
             size_bytes  = size_bytes,
             pages       = pages,
+            s3_key      = s3_key,
             storage_url = storage_url,
             uploaded_at = _utcnow()
         )
     )
 
-    doc_id = result.lastrowid
     return OrderedDict([
-        ('document_id', doc_id),
+        ('document_id', result.lastrowid),
         ('name',        filename),
         ('size',        size_bytes),
         ('pages',       pages)
@@ -976,7 +994,7 @@ def createAssessment(user_id, db, metadata,
     end_dt   = datetime.fromisoformat(end_time)   if end_time   else None
 
     if start_dt is not None and end_dt is not None and start_dt >= end_dt:
-        raise ValueError("start_time must be before end_time")
+        raise ValueError("start_time must be before end_time, start_time: {}, end_time: {}".format(start_time, end_time))
 
     now = _utcnow()
 
@@ -991,9 +1009,9 @@ def createAssessment(user_id, db, metadata,
                 duration_minutes = duration_minutes,
                 subject_code     = subject_code if source_kind == 'topic' else None,
                 document_id      = document_id  if source_kind == 'document' else None,
-                rubric_relevance_limit = rubric['relevance'],
-                rubric_blooms_limit    = rubric['blooms'],
-                rubric_depth_limit     = rubric['depth'],
+                rubric_relevance_limit = rubric['relevance'] if rubric else None,
+                rubric_blooms_limit    = rubric['blooms']    if rubric else None,
+                rubric_depth_limit     = rubric['depth']     if rubric else None,
                 status           = status,
                 start_time       = start_dt,
                 end_time         = end_dt,
@@ -1005,7 +1023,7 @@ def createAssessment(user_id, db, metadata,
         assmt_id = result.lastrowid
 
         # Collect unique section_ids from recipients
-        section_ids = list({r['id'] for r in recipients if r.get('kind') == 'section'})
+        section_ids = list({r['id'] for r in recipients if r.get('kind') == 'section'}) if recipients else []
 
         # Insert section rows
         if section_ids:
@@ -1060,6 +1078,7 @@ def updateAssessment(user_id, db, metadata, assmt_id,
     ca_has_topics           = metadata.tables['ca_has_topics']
     ca_has_students         = metadata.tables['ca_has_students']
     student_section_mapping = metadata.tables['student_section_mapping']
+    ca_documents            = metadata.tables['ca_documents']
 
     if not _checkAccess(user_id, assmt_id, db, metadata):
         return None
@@ -1068,7 +1087,13 @@ def updateAssessment(user_id, db, metadata, assmt_id,
         select(
             curiosity_assessment.c.status,
             curiosity_assessment.c.start_time,
-            curiosity_assessment.c.end_time
+            curiosity_assessment.c.end_time,
+            curiosity_assessment.c.topic_source,
+            curiosity_assessment.c.document_id,
+            curiosity_assessment.c.subject_code,
+            curiosity_assessment.c.question_count,
+            curiosity_assessment.c.duration_minutes,
+            curiosity_assessment.c.rubric_relevance_limit,
         )
         .where(
             and_(
@@ -1082,6 +1107,23 @@ def updateAssessment(user_id, db, metadata, assmt_id,
         return None
 
     current_status = current['status']
+    old_doc_id     = current['document_id']
+
+    # Detect if the existing document will be orphaned after this update:
+    # — new file uploaded (document_id replaced), or
+    # — switching source_kind to 'topic' (document_id cleared to None)
+    will_orphan_doc = old_doc_id is not None and (
+        (document_id is not None and document_id != old_doc_id) or
+        source_kind == 'topic'
+    )
+    old_s3_key = None
+    if will_orphan_doc:
+        old_doc_row = db.execute(
+            select(ca_documents.c.s3_key)
+            .where(ca_documents.c.doc_id == old_doc_id)
+        ).mappings().first()
+        if old_doc_row:
+            old_s3_key = old_doc_row['s3_key']
 
     # Validate status transition
     ALLOWED_TRANSITIONS = {
@@ -1115,12 +1157,50 @@ def updateAssessment(user_id, db, metadata, assmt_id,
     if status == 'draft':
         values['start_time'] = None
         values['end_time']   = None
+    # When switching source_kind, clear the opposing field so stale data doesn't persist
+    if source_kind == 'document':
+        values['subject_code'] = None
+    elif source_kind == 'topic':
+        values['document_id']  = None
 
     # Validate effective time window — compare incoming values against existing DB times
     effective_start = values.get('start_time', current['start_time'])
     effective_end   = values.get('end_time',   current['end_time'])
     if effective_start is not None and effective_end is not None and effective_start >= effective_end:
-        raise ValueError("start_time must be before end_time")
+        raise ValueError("start_time must be before end_time, start_time: {}, end_time: {}".format(effective_start, effective_end))
+
+    # Completeness check when transitioning to live/scheduled — merge incoming with current DB state
+    if status in ('live', 'scheduled'):
+        eff_source_kind    = values.get('topic_source',          current['topic_source'])
+        eff_document_id    = values.get('document_id',           current['document_id'])
+        eff_subject_code   = values.get('subject_code',          current['subject_code'])
+        eff_question_count = values.get('question_count',        current['question_count'])
+        eff_duration       = values.get('duration_minutes',      current['duration_minutes'])
+        eff_rubric         = values.get('rubric_relevance_limit', current['rubric_relevance_limit'])
+
+        missing = []
+        if not eff_source_kind:                                   missing.append('source_kind')
+        if eff_source_kind == 'document' and not eff_document_id: missing.append('file/document')
+        if eff_source_kind == 'topic':
+            if not eff_subject_code:                              missing.append('subject_code')
+            has_topics = topic_ids or db.execute(
+                select(ca_has_topics.c.topic_id)
+                .where(ca_has_topics.c.ca_id == assmt_id)
+                .limit(1)
+            ).mappings().first()
+            if not has_topics:                                    missing.append('topic_ids')
+        if not eff_question_count:                                missing.append('question_count')
+        if not eff_duration:                                      missing.append('duration_minutes')
+        if not eff_rubric:                                        missing.append('rubric')
+        has_sections = recipients or db.execute(
+            select(ca_has_sections.c.section_id)
+            .where(ca_has_sections.c.ca_id == assmt_id)
+            .limit(1)
+        ).mappings().first()
+        if not has_sections:                                      missing.append('recipients')
+
+        if missing:
+            raise ValueError("Missing required fields for {} status: {}".format(status, ', '.join(missing)))
 
     try:
         db.execute(
@@ -1144,23 +1224,29 @@ def updateAssessment(user_id, db, metadata, assmt_id,
 
             # If going live, expand students from updated sections
             if status == 'live' and new_section_ids:
-                student_rows = db.execute(
+                candidate_rows = db.execute(
                     select(student_section_mapping.c.student_id)
                     .where(student_section_mapping.c.section_id.in_(new_section_ids))
                 ).mappings().all()
-                if student_rows:
-                    db.execute(
-                        ca_has_students.insert(),
-                        [
-                            {
-                                'ca_id':      assmt_id,
-                                'student_id': r['student_id'],
-                                'status':     'not_started',
-                                'added_at':   _utcnow()
-                            }
-                            for r in student_rows
-                        ]
-                    )
+                if candidate_rows:
+                    already_enrolled = {r['student_id'] for r in db.execute(
+                        select(ca_has_students.c.student_id)
+                        .where(ca_has_students.c.ca_id == assmt_id)
+                    ).mappings().all()}
+                    new_students = [r for r in candidate_rows if r['student_id'] not in already_enrolled]
+                    if new_students:
+                        db.execute(
+                            ca_has_students.insert(),
+                            [
+                                {
+                                    'ca_id':      assmt_id,
+                                    'student_id': r['student_id'],
+                                    'status':     'not_started',
+                                    'added_at':   _utcnow()
+                                }
+                                for r in new_students
+                            ]
+                        )
 
         # If going live without changing recipients, expand students from existing sections
         elif status == 'live':
@@ -1170,25 +1256,31 @@ def updateAssessment(user_id, db, metadata, assmt_id,
             ).mappings().all()
             existing_section_ids = [r['section_id'] for r in existing_sections]
             if existing_section_ids:
-                student_rows = db.execute(
+                candidate_rows = db.execute(
                     select(student_section_mapping.c.student_id)
                     .where(student_section_mapping.c.section_id.in_(existing_section_ids))
                 ).mappings().all()
-                if student_rows:
-                    db.execute(
-                        ca_has_students.insert(),
-                        [
-                            {
-                                'ca_id':      assmt_id,
-                                'student_id': r['student_id'],
-                                'status':     'not_started',
-                                'added_at':   _utcnow()
-                            }
-                            for r in student_rows
-                        ]
-                    )
+                if candidate_rows:
+                    already_enrolled = {r['student_id'] for r in db.execute(
+                        select(ca_has_students.c.student_id)
+                        .where(ca_has_students.c.ca_id == assmt_id)
+                    ).mappings().all()}
+                    new_students = [r for r in candidate_rows if r['student_id'] not in already_enrolled]
+                    if new_students:
+                        db.execute(
+                            ca_has_students.insert(),
+                            [
+                                {
+                                    'ca_id':      assmt_id,
+                                    'student_id': r['student_id'],
+                                    'status':     'not_started',
+                                    'added_at':   _utcnow()
+                                }
+                                for r in new_students
+                            ]
+                        )
 
-        # Re-sync topics if changed (topic mode)
+        # Re-sync topics if changed, or purge if switching to document mode
         if topic_ids is not None:
             db.execute(
                 ca_has_topics.delete()
@@ -1199,11 +1291,32 @@ def updateAssessment(user_id, db, metadata, assmt_id,
                     ca_has_topics.insert(),
                     [{'ca_id': assmt_id, 'topic_id': tid} for tid in topic_ids]
                 )
+        elif source_kind == 'document':
+            db.execute(
+                ca_has_topics.delete()
+                .where(ca_has_topics.c.ca_id == assmt_id)
+            )
+
+        # Remove orphaned ca_documents row inside the transaction so the
+        # DB stays consistent even if the S3 delete below fails.
+        if will_orphan_doc:
+            db.execute(
+                ca_documents.delete()
+                .where(ca_documents.c.doc_id == old_doc_id)
+            )
 
         db.commit()
     except Exception:
         db.rollback()
         raise
+
+    # S3 delete is best-effort after commit — an orphaned object is acceptable;
+    # a failed DB commit with a deleted S3 object is not.
+    if old_s3_key:
+        try:
+            _s3.delete_object(Bucket=_S3_BUCKET, Key=old_s3_key)
+        except Exception:
+            pass
 
     return _fetchAssessmentById(assmt_id, db, metadata)
 
@@ -1353,7 +1466,7 @@ def getAssessmentByID(user_id, db, metadata, assmt_id):
             ('url',         first['doc_url']),
         ]) if first['document_id'] else None
 
-    else:
+    elif topic_source == 'topic':
         # topic mode — Query 2: join ca_has_topics → subject_topic_mappings directly.
         # No user/subject chain needed: topics were validated at creation time.
         topic_rows = db.execute(
@@ -1392,6 +1505,10 @@ def getAssessmentByID(user_id, db, metadata, assmt_id):
             ]))
         syllabus = list(units_dict.values())
 
+    else:
+        # source_kind not yet set — title-only draft
+        syllabus = None
+
     return OrderedDict([
         ('assmt_id',         first['assmt_id']),
         ('title',            first['assmt_title']),
@@ -1418,28 +1535,57 @@ def getAssessmentByID(user_id, db, metadata, assmt_id):
 # MONITOR — Live view
 # ============================================================
 
-def getAssessmentStats(user_id, db, metadata, assmt_id, score_band=None, status_filter=None):
-    curiosity_assessment    = metadata.tables['curiosity_assessment']
-    ca_has_students         = metadata.tables['ca_has_students']
-    ca_question_submissions = metadata.tables['ca_question_submissions']
-    college_account_new     = metadata.tables['college_account_new']
+def getAssessmentStats(user_id, db, metadata, assmt_id, sort=None):
+    curiosity_assessment           = metadata.tables['curiosity_assessment']
+    ca_has_students                = metadata.tables['ca_has_students']
+    ca_question_submissions        = metadata.tables['ca_question_submissions']
+    college_account_new            = metadata.tables['college_account_new']
+    ca_has_sections                = metadata.tables['ca_has_sections']
+    college_department_section_new = metadata.tables['college_department_section_new']
+    ca_documents                   = metadata.tables['ca_documents']
+    ca_has_topics                  = metadata.tables['ca_has_topics']
+    subject_topic_mappings         = metadata.tables['subject_topic_mappings']
+    college_subject_mapping        = metadata.tables['college_subject_mapping']
+    subject_semester_new           = metadata.tables['subject_semester_new']
+    subject_master                 = metadata.tables['subject_master']
 
     if not _checkAccess(user_id, assmt_id, db, metadata):
         return None
 
-    # Single query — assessment LEFT JOIN students.
-    # total_questions_asked runs as a scalar subquery (one DB-side evaluation).
-    # Status counts and top_score are derived in Python from the returned rows.
+    # Total questions asked across all students (scalar subquery)
     total_q_subq = (
         select(func.count(ca_question_submissions.c.q_id))
         .where(ca_question_submissions.c.ca_id == assmt_id)
         .scalar_subquery()
     )
 
+    # Per-student question count (correlated scalar subquery)
+    student_q_subq = (
+        select(func.count(ca_question_submissions.c.q_id))
+        .where(
+            and_(
+                ca_question_submissions.c.ca_id == assmt_id,
+                ca_question_submissions.c.student_id == ca_has_students.c.student_id
+            )
+        )
+        .correlate(ca_has_students)
+        .scalar_subquery()
+    )
+
+    sort_map = {
+        'score-desc': ca_has_students.c.avg_composite_score.desc(),
+        'score-asc':  ca_has_students.c.avg_composite_score.asc(),
+        'name-asc':   college_account_new.c.name.asc(),
+        'name-desc':  college_account_new.c.name.desc(),
+        'time-asc':   ca_has_students.c.submitted_at.asc()
+    }
+    order = sort_map.get(sort, college_account_new.c.name.asc())
+
     rows = db.execute(
         select(
             curiosity_assessment.c.assmt_id,
             curiosity_assessment.c.assmt_title,
+            curiosity_assessment.c.topic_source,
             curiosity_assessment.c.subject_code,
             curiosity_assessment.c.question_count,
             curiosity_assessment.c.duration_minutes,
@@ -1459,7 +1605,9 @@ def getAssessmentStats(user_id, db, metadata, assmt_id, score_band=None, status_
             ca_has_students.c.avg_b_score.label('student_b'),
             ca_has_students.c.avg_d_score.label('student_d'),
             college_account_new.c.name.label('student_name'),
-            college_account_new.c.roll_number.label('roll')
+            college_account_new.c.roll_number.label('roll'),
+            student_q_subq.label('student_q_count'),
+            ca_has_students.c.started_at
         )
         .select_from(
             curiosity_assessment
@@ -1469,21 +1617,23 @@ def getAssessmentStats(user_id, db, metadata, assmt_id, score_band=None, status_
                 college_account_new.c.id == ca_has_students.c.student_id)
         )
         .where(curiosity_assessment.c.assmt_id == assmt_id)
-        .order_by(college_account_new.c.name.asc())
+        .order_by(order)
     ).mappings().all()
 
     if not rows:
         return None
 
     # Assessment fields are identical across all rows — read from first
-    first       = rows[0]
-    view_status = first['status']
-    avg_score   = round(float(first['avg_composite_score']), 2) if first['avg_composite_score'] else None
+    first        = rows[0]
+    view_status  = first['status']
+    topic_source = first['topic_source']
+    avg_score    = round(float(first['avg_composite_score']), 2) if first['avg_composite_score'] else None
 
     # Single pass over rows — counts, top_score, and student list together
-    counts    = {'submitted': 0, 'writing': 0, 'not_started': 0}
-    top_score = None
-    students  = []
+    counts        = {'submitted': 0, 'writing': 0, 'not_started': 0}
+    top_score     = None
+    students      = []
+    elapsed_times = []
 
     for row in rows:
         if row['student_id'] is None:
@@ -1503,6 +1653,14 @@ def getAssessmentStats(user_id, db, metadata, assmt_id, score_band=None, status_
         if score is not None and (top_score is None or score > top_score):
             top_score = score
 
+        if st in ('submitted', 'writing') and row['started_at'] is not None:
+            if st == 'submitted' and row['submitted_at'] is not None:
+                secs = (row['submitted_at'] - row['started_at']).total_seconds()
+            else:
+                secs = (_utcnow() - row['started_at']).total_seconds()
+            if secs > 0:
+                elapsed_times.append(secs)
+
         if view_status == 'live':
             students.append(OrderedDict([
                 ('student_id',      row['student_id']),
@@ -1510,6 +1668,7 @@ def getAssessmentStats(user_id, db, metadata, assmt_id, score_band=None, status_
                 ('roll',            row['roll']),
                 ('status',          st),
                 ('submission_time', submission_time),
+                ('question_count',  int(row['student_q_count'] or 0)),
                 ('score',           score)
             ]))
         else:
@@ -1519,6 +1678,7 @@ def getAssessmentStats(user_id, db, metadata, assmt_id, score_band=None, status_
                 ('roll',            row['roll']),
                 ('status',          'absent' if st == 'not_started' else st),
                 ('submission_time', submission_time),
+                ('question_count',  int(row['student_q_count'] or 0)),
                 ('score',           score),
                 ('dims', OrderedDict([
                     ('relevance', round(float(row['student_r']), 2) if row['student_r'] else None),
@@ -1527,50 +1687,154 @@ def getAssessmentStats(user_id, db, metadata, assmt_id, score_band=None, status_
                 ]))
             ]))
 
-    total_enrolled = sum(counts.values())
+    total_enrolled   = sum(counts.values())
+    avg_elapsed_secs = sum(elapsed_times) / len(elapsed_times) if elapsed_times else None
+    avg_time_elapsed = _format_duration(avg_elapsed_secs) if avg_elapsed_secs else None
+
+    # Sections assigned to this assessment
+    section_rows = db.execute(
+        select(college_department_section_new.c.section_name)
+        .select_from(
+            ca_has_sections
+            .join(college_department_section_new,
+                college_department_section_new.c.id == ca_has_sections.c.section_id)
+        )
+        .where(ca_has_sections.c.ca_id == assmt_id)
+        .order_by(college_department_section_new.c.section_name)
+    ).mappings().all()
+    sections = [r['section_name'] for r in section_rows]
+
+    # Syllabus block — shape depends on topic_source
+    if topic_source == 'document':
+        doc_row = db.execute(
+            select(
+                ca_documents.c.name.label('doc_name'),
+                ca_documents.c.storage_url.label('doc_url'),
+                ca_documents.c.pages
+            )
+            .select_from(
+                curiosity_assessment
+                .join(ca_documents,
+                    ca_documents.c.doc_id == curiosity_assessment.c.document_id)
+            )
+            .where(curiosity_assessment.c.assmt_id == assmt_id)
+        ).mappings().first()
+
+        syllabus = OrderedDict([
+            ('source_kind', 'document'),
+            ('name',        doc_row['doc_name']  if doc_row else None),
+            ('url',         doc_row['doc_url']   if doc_row else None),  # TODO: replace with S3 pre-signed URL
+            ('pages',       doc_row['pages']     if doc_row else None)
+        ])
+
+    else:
+        # Topic mode — subject name + unit/topic breakdown
+        subject_row = db.execute(
+            select(subject_master.c.name.label('subject_name'))
+            .select_from(
+                college_subject_mapping
+                .join(subject_semester_new,
+                    subject_semester_new.c.id == college_subject_mapping.c.subject_semester_id)
+                .join(subject_master,
+                    subject_master.c.id == subject_semester_new.c.subject_master_id)
+            )
+            .where(college_subject_mapping.c.subject_code == first['subject_code'])
+        ).mappings().first()
+
+        topic_rows = db.execute(
+            select(
+                subject_topic_mappings.c.unit_id,
+                subject_topic_mappings.c.unit_name,
+                subject_topic_mappings.c.topic_name
+            )
+            .select_from(
+                ca_has_topics
+                .join(subject_topic_mappings,
+                    subject_topic_mappings.c.topic_id == ca_has_topics.c.topic_id)
+            )
+            .where(ca_has_topics.c.ca_id == assmt_id)
+            .order_by(subject_topic_mappings.c.unit_id, subject_topic_mappings.c.topic_id)
+        ).mappings().all()
+
+        units_dict = OrderedDict()
+        for r in topic_rows:
+            uid = r['unit_id']
+            if uid not in units_dict:
+                units_dict[uid] = OrderedDict([
+                    ('unit_name', r['unit_name']),
+                    ('topics',    [])
+                ])
+            units_dict[uid]['topics'].append(r['topic_name'])
+
+        topic_count = sum(len(u['topics']) for u in units_dict.values())
+
+        syllabus = OrderedDict([
+            ('source_kind',  'topic'),
+            ('subject_name', subject_row['subject_name'] if subject_row else None),
+            ('topic_count',  topic_count),
+            ('units',        list(units_dict.values()))
+        ])
 
     assessment_block = OrderedDict([
         ('assmt_id',         first['assmt_id']),
         ('title',            first['assmt_title']),
-        ('subject_code',     first['subject_code']),
         ('question_count',   first['question_count']),
         ('duration_minutes', first['duration_minutes']),
-        ('status',           view_status)
+        ('status',           view_status),
+        ('total_enrolled',   total_enrolled),
+        ('sections',         sections),
+        ('syllabus',         syllabus)
     ])
 
     if view_status == 'live':
+        prev_row = db.execute(
+            select(curiosity_assessment.c.avg_composite_score.label('prev_avg'))
+            .where(
+                and_(
+                    curiosity_assessment.c.created_by == user_id,
+                    curiosity_assessment.c.status == 'ended',
+                    curiosity_assessment.c.assmt_id != assmt_id,
+                    curiosity_assessment.c.avg_composite_score.isnot(None)
+                )
+            )
+            .order_by(curiosity_assessment.c.updated_at.desc())
+            .limit(1)
+        ).mappings().first()
+
+        if prev_row and avg_score is not None:
+            prev_avg = round(float(prev_row['prev_avg']), 2)
+            delta    = round(avg_score - prev_avg, 2)
+            score_vs_last = OrderedDict([
+                ('previous_avg', prev_avg),
+                ('delta',        delta),
+                ('direction',    'up' if delta > 0 else ('down' if delta < 0 else 'same'))
+            ])
+        else:
+            score_vs_last = None
+
         return OrderedDict([
             ('assessment', assessment_block),
             ('summary', OrderedDict([
-                ('total_enrolled',    total_enrolled),
                 ('submitted_count',   counts['submitted']),
                 ('writing_count',     counts['writing']),
                 ('not_started_count', counts['not_started']),
                 ('avg_score',         avg_score),
+                ('avg_time_elapsed',  avg_time_elapsed),
+                ('score_vs_last',     score_vs_last),
                 ('closes_in',         _closes_in_label(first['end_time']))
             ])),
             ('students', students)
         ])
 
-    # Ended-view filters — only affect the student list, never the summary
-    if score_band:
-        try:
-            low, high = float(score_band.split('-')[0]), float(score_band.split('-')[1])
-            students = [s for s in students if s['score'] is not None and low <= s['score'] < high]
-        except (ValueError, IndexError):
-            pass
-    if status_filter in ('submitted', 'absent'):
-        students = [s for s in students if s['status'] == status_filter]
-
     return OrderedDict([
         ('assessment', assessment_block),
         ('summary', OrderedDict([
-            ('total_enrolled',        total_enrolled),
             ('submitted_count',       counts['submitted']),
             ('missed_count',          counts['not_started']),
             ('total_questions_asked', int(first['total_questions_asked'] or 0)),
             ('avg_score',             avg_score),
             ('avg_score_pct',         round(avg_score / 10 * 100, 2) if avg_score else None),
+            ('avg_time_elapsed',      avg_time_elapsed),
             ('top_score',             top_score),
             ('top_score_pct',         round(top_score / 10 * 100, 2) if top_score else None),
             ('median_time',           _format_duration(first['median_time_seconds'])),
@@ -1748,6 +2012,45 @@ def getStudentQuestions(user_id, db, metadata, assmt_id, student_id):
     ])
 
 
+def getTopQuestions(user_id, db, metadata, assmt_id):
+    ca_question_submissions = metadata.tables['ca_question_submissions']
+
+    if not _checkAccess(user_id, assmt_id, db, metadata):
+        return None
+    
+    limit = 6
+    rows = db.execute(
+        select(
+            ca_question_submissions.c.q_id,
+            ca_question_submissions.c.question,
+            ca_question_submissions.c.r_score,
+            ca_question_submissions.c.b_score,
+            ca_question_submissions.c.d_score,
+            ca_question_submissions.c.composite_score,
+        )
+        .where(
+            and_(
+                ca_question_submissions.c.ca_id == assmt_id,
+                ca_question_submissions.c.composite_score.isnot(None)
+            )
+        )
+        .order_by(ca_question_submissions.c.composite_score.desc())
+        .limit(limit)
+    ).mappings().all()
+
+    return [
+        OrderedDict([
+            ('q_id',            row['q_id']),
+            ('question',        row['question']),
+            ('composite_score', round(float(row['composite_score']), 2)),
+            ('r_score',         round(float(row['r_score']), 2) if row['r_score'] else None),
+            ('b_score',         round(float(row['b_score']), 2) if row['b_score'] else None),
+            ('d_score',         round(float(row['d_score']), 2) if row['d_score'] else None),
+        ])
+        for row in rows
+    ]
+
+
 def getAssessmentDocument(user_id, db, metadata, assmt_id, created_by=None):
     curiosity_assessment = metadata.tables['curiosity_assessment']
     ca_documents         = metadata.tables['ca_documents']
@@ -1853,7 +2156,7 @@ def getAssessmentSyllabus(user_id, db, metadata, assmt_id):
 
     if assmt['topic_source'] == 'document':
         return getAssessmentDocument(user_id, db, metadata, assmt_id, created_by=assmt['created_by'])
-    return getAssessmentTopics(user_id, db, metadata, assmt_id, created_by=assmt['created_by'])
+    return getAssessmentTopics(db, metadata, assmt_id)
 
 
 def sendStudentFeedback(user_id, db, metadata, assmt_id, student_id, message_text):
@@ -1971,7 +2274,7 @@ def endAssessment(user_id, db, metadata, assmt_id):
     )
     db.commit()
 
-    return _fetchAssessmentById(assmt_id, db, metadata)
+    return {'assmt_id': assmt_id, 'status': 'ended'}
 
 
 # ============================================================
@@ -2039,7 +2342,6 @@ def exportAssessment(user_id, db, metadata, assmt_id, fmt, columns):
         select(
             curiosity_assessment.c.created_by,
             curiosity_assessment.c.assmt_title,
-            curiosity_assessment.c.question_count
         )
         .where(curiosity_assessment.c.assmt_id == assmt_id)
     ).mappings().first()
@@ -2047,79 +2349,93 @@ def exportAssessment(user_id, db, metadata, assmt_id, fmt, columns):
     if not assmt or not _checkAccess(user_id, assmt_id, db, metadata, created_by=assmt['created_by']):
         return None
 
-    # Fetch full dataset.
-    # Join student_section_mapping → ca_has_sections to resolve each
-    # student's section within this assessment (avoids Cartesian product).
-    rows = db.execute(
-        select(
-            college_account_new.c.name.label('student_name'),
-            college_account_new.c.roll_number.label('roll'),
-            college_department_section_new.c.section_name.label('section'),
-            ca_has_students.c.status,
-            ca_has_students.c.submitted_at,
-            ca_has_students.c.time_elapsed_seconds,
-            ca_has_students.c.avg_composite_score.label('total_score'),
-            ca_has_students.c.avg_r_score.label('avg_relevance'),
-            ca_has_students.c.avg_b_score.label('avg_blooms'),
-            ca_has_students.c.avg_d_score.label('avg_depth'),
-            func.count(distinct(ca_question_submissions.c.q_id)).label('q_submitted')
-        )
-        .select_from(
-            ca_has_students
-            .join(college_account_new,
-                college_account_new.c.id == ca_has_students.c.student_id)
-            .join(student_section_mapping,
-                student_section_mapping.c.student_id == ca_has_students.c.student_id)
-            .join(ca_has_sections,
-                and_(
-                    ca_has_sections.c.section_id == student_section_mapping.c.section_id,
-                    ca_has_sections.c.ca_id == assmt_id
-                ))
-            .join(college_department_section_new,
-                college_department_section_new.c.id == ca_has_sections.c.section_id)
-            .outerjoin(ca_question_submissions,
-                and_(
-                    ca_question_submissions.c.ca_id == ca_has_students.c.ca_id,
-                    ca_question_submissions.c.student_id == ca_has_students.c.student_id
-                ))
-        )
+    # name and roll always included; strip unknowns and duplicates while preserving order
+    VALID_COLS = {'name', 'roll', 'section', 'total_score', 'relevance_pct',
+                  'blooms_level', 'depth', 'q_submitted', 'submission_time'}
+    active_columns = ['name', 'roll'] + [c for c in columns if c not in ('name', 'roll') and c in VALID_COLS]
+
+    need_q_submitted = 'q_submitted' in active_columns
+
+    # SQLAlchemy expressions for each column key — only the selected ones are projected
+    col_exprs = {
+        'name':            college_account_new.c.name.label('student_name'),
+        'roll':            college_account_new.c.roll_number.label('roll'),
+        'section':         college_department_section_new.c.section_name.label('section'),
+        'total_score':     ca_has_students.c.avg_composite_score.label('total_score'),
+        'relevance_pct':   ca_has_students.c.avg_r_score.label('avg_relevance'),
+        'blooms_level':    ca_has_students.c.avg_b_score.label('avg_blooms'),
+        'depth':           ca_has_students.c.avg_d_score.label('avg_depth'),
+        'q_submitted':     func.count(distinct(ca_question_submissions.c.q_id)).label('q_submitted'),
+        'submission_time': ca_has_students.c.submitted_at,
+    }
+
+    # Section joins are always included — they're small indexed lookups.
+    # Submissions outerjoin is the only conditional: it reads a large table
+    # and forces a GROUP BY, so skip it entirely when q_submitted isn't requested.
+    from_clause = (
+        ca_has_students
+        .join(college_account_new,
+            college_account_new.c.id == ca_has_students.c.student_id)
+        .join(student_section_mapping,
+            student_section_mapping.c.student_id == ca_has_students.c.student_id)
+        .join(ca_has_sections,
+            and_(
+                ca_has_sections.c.section_id == student_section_mapping.c.section_id,
+                ca_has_sections.c.ca_id == assmt_id
+            ))
+        .join(college_department_section_new,
+            college_department_section_new.c.id == ca_has_sections.c.section_id)
+    )
+    if need_q_submitted:
+        from_clause = from_clause.outerjoin(ca_question_submissions,
+            and_(
+                ca_question_submissions.c.ca_id == ca_has_students.c.ca_id,
+                ca_question_submissions.c.student_id == ca_has_students.c.student_id
+            ))
+
+    query = (
+        select(*[col_exprs[c] for c in active_columns])
+        .select_from(from_clause)
         .where(ca_has_students.c.ca_id == assmt_id)
-        .group_by(
-            ca_has_students.c.student_id,
-            ca_has_students.c.status,
-            ca_has_students.c.submitted_at,
-            ca_has_students.c.time_elapsed_seconds,
-            college_account_new.c.id,
-            college_department_section_new.c.id
-        )
         .order_by(college_account_new.c.name)
-    ).mappings().all()
+    )
+
+    # GROUP BY only needed when q_submitted (aggregate) is selected.
+    if need_q_submitted:
+        hs_group_cols = {
+            'total_score':     ca_has_students.c.avg_composite_score,
+            'relevance_pct':   ca_has_students.c.avg_r_score,
+            'blooms_level':    ca_has_students.c.avg_b_score,
+            'depth':           ca_has_students.c.avg_d_score,
+            'submission_time': ca_has_students.c.submitted_at,
+        }
+        group_cols = [ca_has_students.c.student_id, college_account_new.c.id,
+                      college_department_section_new.c.id]
+        group_cols += [hs_group_cols[c] for c in active_columns if c in hs_group_cols]
+        query = query.group_by(*group_cols)
+
+    rows = db.execute(query).mappings().all()
 
     if not rows:
         return None
 
-    # Column whitelist — maps requested column key to output label + value extractor
     COLUMN_MAP = {
         'name':            ('Name',                lambda r: r['student_name']),
         'roll':            ('Roll',                lambda r: r['roll']),
         'section':         ('Section',             lambda r: r['section']),
         'total_score':     ('Total Score',         lambda r: round(float(r['total_score']), 2) if r['total_score'] else None),
         'relevance_pct':   ('Relevance %',         lambda r: round(float(r['avg_relevance']), 2) if r['avg_relevance'] else None),
-        'blooms_level':    ("Bloom's Level",       lambda r: round(float(r['avg_blooms']), 2) if r['avg_blooms'] else None),
+        'blooms_level':    ("Bloom's Level",        lambda r: round(float(r['avg_blooms']), 2) if r['avg_blooms'] else None),
         'depth':           ('Depth',               lambda r: round(float(r['avg_depth']), 2) if r['avg_depth'] else None),
         'q_submitted':     ('Questions Submitted', lambda r: int(r['q_submitted'])),
-        'submission_time': ('Submission Time',     lambda r: r['submitted_at'].isoformat() if r['submitted_at'] else None)
+        'submission_time': ('Submission Time',     lambda r: r['submitted_at'].isoformat() if r['submitted_at'] else None),
     }
 
-    # name and roll are always included; merge with requested columns preserving order
-    active_columns = ['name', 'roll'] + [c for c in columns if c not in ('name', 'roll') and c in COLUMN_MAP]
-
-    headers = [COLUMN_MAP[c][0] for c in active_columns]
-    export_rows = []
-    for row in rows:
-        export_rows.append(
-            {COLUMN_MAP[c][0]: COLUMN_MAP[c][1](row) for c in active_columns}
-        )
+    headers    = [COLUMN_MAP[c][0] for c in active_columns]
+    export_rows = [
+        {COLUMN_MAP[c][0]: COLUMN_MAP[c][1](row) for c in active_columns}
+        for row in rows
+    ]
 
     safe_title = assmt['assmt_title'].replace(' ', '_')[:40]
     filename   = 'CA_{}_{}.{}'.format(safe_title, assmt_id, fmt)
