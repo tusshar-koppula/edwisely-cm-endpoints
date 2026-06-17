@@ -149,10 +149,9 @@ def createOrUpdateAssessment(user):
     # ── Shared — db connection + document upload (runs before POST/PATCH split) ─
     try:
         db          = get_db()
-        document_id = None
+        doc_info = None
         if request.files.get('file'):
-            upload_result = curiosity_assessment_data.uploadDocument(user_id, db, metadata, request.files.get('file'))
-            document_id   = upload_result['document_id']
+            doc_info = curiosity_assessment_data.uploadDocument(user_id, db, metadata, request.files.get('file'))
     except Exception as e:
         subject = "server:- {}, Error in /createOrUpdateCuriosityAssessments".format(os.environ.get('FLASK_ENV'))
         try:
@@ -165,7 +164,7 @@ def createOrUpdateAssessment(user):
 
     if request.method == 'POST':
         # ── POST — Create assessment ──────────────────────────────────────────────
-        title            = request.form.get('title')
+        title            = request.form.get('title', "New curiosity assessment")
         topic_ids_raw    = request.form.get('topic_ids')
         recipients_raw   = request.form.get('recipients')
         question_count   = request.form.get('question_count')
@@ -181,23 +180,20 @@ def createOrUpdateAssessment(user):
         recipients = json.loads(recipients_raw) if recipients_raw else None
         rubric     = json.loads(rubric_raw)     if rubric_raw     else None
 
-        if not title:
-            return jsonify({"status": 422, "message": "title is missing"})
-
         if status in ('live', 'scheduled'):
             missing = []
-            if not source_kind:                               missing.append('source_kind')
-            if source_kind == 'document' and not document_id: missing.append('file')
-            if source_kind == 'topic'    and not topic_ids:  missing.append('topic_ids')
+            if not source_kind:                                missing.append('source_kind')
+            if source_kind == 'document' and not doc_info: missing.append('file')
+            if source_kind == 'topic'    and not topic_ids:   missing.append('topic_ids')
             if source_kind == 'topic'    and not subject_code: missing.append('subject_code')
-            if not recipients:                                missing.append('recipients')
-            if not question_count:                            missing.append('question_count')
-            if not duration_minutes:                          missing.append('duration_minutes')
-            if not rubric:                                    missing.append('rubric')
+            if not recipients:                                 missing.append('recipients')
+            if not question_count:                             missing.append('question_count')
+            if not duration_minutes:                           missing.append('duration_minutes')
+            if not rubric:                                     missing.append('rubric')
+            if not start_time:                                 missing.append('start_time')
+            if not end_time:                                   missing.append('end_time')
             if missing:
                 return jsonify({"status": 422, "message": "Missing required fields for {} status: {}".format(status, ', '.join(missing))})
-        else:
-            status = 'draft'
 
         try:
             question_count   = int(question_count)   if question_count   else None
@@ -208,12 +204,12 @@ def createOrUpdateAssessment(user):
         try:
             data = curiosity_assessment_data.createAssessment(
                 user_id, db, metadata,
-                title, description, source_kind, document_id, topic_ids,
+                title, description, source_kind, doc_info, topic_ids,
                 subject_code, recipients, question_count, duration_minutes,
                 start_time, end_time, rubric, status
             )
             if data:
-                return jsonify({"status": 200, "message": "Successfully fetched Data", "data": data})
+                return jsonify({"status": 200, "message": "Successfully created Assessment", "data": data})
             else:
                 return jsonify({"status": 400, "message": "No Data Found!!"})
 
@@ -264,7 +260,7 @@ def createOrUpdateAssessment(user):
         try:
             data = curiosity_assessment_data.updateAssessment(
                 user_id, db, metadata, assessment_id,
-                title, description, source_kind, document_id, topic_ids,
+                title, description, source_kind, doc_info, topic_ids,
                 subject_code, recipients, question_count, duration_minutes,
                 start_time, end_time, rubric, status
             )
@@ -321,7 +317,7 @@ def deleteAssessment(user):
             return jsonify({"status": 500, "message": str(e)})
 
 
-# ── Route 3 (duplicate) — /assessments/<assessment_id>/duplicate (POST) ─────
+# ── Route 3 (duplicate) — /duplicateCuriosityAssessments (POST) ─────
 @curiosity_assessment.route('/duplicateCuriosityAssessments', methods=['POST']) # duplicateAssessment
 @authorize
 def duplicateAssessment(user):
@@ -347,13 +343,13 @@ def duplicateAssessment(user):
             return jsonify({"status": 400, "message": "No Data Found!!"})
 
     except Exception as e:
-        subject = "server:- {}, Error in /duplicateCuriosityAssessments/<int:assessment_id>".format(os.environ.get('FLASK_ENV'))
+        subject = "server:- {}, Error in /duplicateCuriosityAssessments".format(os.environ.get('FLASK_ENV'))
         try:
             sg_client = SendGridAPIClient(os.environ.get('SENDGRID_API_KEY'))
             sg_client.send(Mail(from_email='noreply@edwisely.com', to_emails='alerts@edwisely.com', subject=subject, plain_text_content=str(e)))
         except Exception:
             pass
-        current_app.logger.error('/assessments/<assessment_id>/duplicate - EXCEPTION: {}'.format(e))
+        current_app.logger.error('/duplicateCuriosityAssessments - EXCEPTION: {}'.format(e))
         return jsonify({"status": 500, "message": str(e)})
 
 
@@ -377,13 +373,13 @@ def endCuriosityAssessment(user):
             return jsonify({"status": 400, "message": "No Data Found!!"})
 
     except Exception as e:
-        subject = "server:- {}, Error in /assessments/<assessment_id>".format(os.environ.get('FLASK_ENV'))
+        subject = "server:- {}, Error in /endCuriosityAssessments".format(os.environ.get('FLASK_ENV'))
         try:
             sg_client = SendGridAPIClient(os.environ.get('SENDGRID_API_KEY'))
             sg_client.send(Mail(from_email='noreply@edwisely.com', to_emails='alerts@edwisely.com', subject=subject, plain_text_content=str(e)))
         except Exception:
             pass
-        current_app.logger.error('/assessments/<assessment_id> - EXCEPTION: {}'.format(e))
+        current_app.logger.error('/endCuriosityAssessments - EXCEPTION: {}'.format(e))
         return jsonify({"status": 500, "message": str(e)})
 
 
@@ -448,7 +444,7 @@ def getAssessmentScorebands(user):
         return jsonify({"status": 500, "message": str(e)})
 
 
-# ── Route 3a — /assessments/<assessment_id>/students/<student_id>/stats (GET) ─
+# ── Route 3a — /getCuriosityAssessmentsStudentSubmissionStats (GET) ─
 # Used when faculty clicks on a student in the Ended Students list.
 # returns that student's attempt data (questions, answers, scores, dimension breakdown, feedback etc.) for the selected assessment.
 @curiosity_assessment.route('/getCuriosityAssessmentsStudentSubmissionStats', methods=['GET'])
@@ -486,7 +482,7 @@ def getStudentStats(user):
         return jsonify({"status": 500, "message": str(e)})
 
 
-# ── Route 3b — /sendCuriosityAssessmentsFeedback/<int:assessment_id>/students/<int:student_id> (POST) ─
+# ── Route 3b — /writeCuriosityAssessmentsStudentFeedback (POST) ─
 #Allow faculty to send feedback to students on their assessment attempt.
 #Called when faculty submits feedback form in the End Assessment view.
 @curiosity_assessment.route('/writeCuriosityAssessmentsStudentFeedback', methods=['POST'])
@@ -518,13 +514,13 @@ def sendStudentFeedback(user):
             return jsonify({"status": 400, "message": "No Data Found!!"})
 
     except Exception as e:
-        subject = "server:- {}, Error in /sendCuriosityAssessmentsStudentFeedback/<int:assessment_id>/students/<int:student_id>".format(os.environ.get('FLASK_ENV'))
+        subject = "server:- {}, Error in /writeCuriosityAssessmentsStudentFeedback".format(os.environ.get('FLASK_ENV'))
         try:
             sg_client = SendGridAPIClient(os.environ.get('SENDGRID_API_KEY'))
             sg_client.send(Mail(from_email='noreply@edwisely.com', to_emails='alerts@edwisely.com', subject=subject, plain_text_content=str(e)))
         except Exception:
             pass
-        current_app.logger.error('/sendCuriosityAssessmentsStudentFeedback/<int:assessment_id>/students/<int:student_id> - EXCEPTION: {}'.format(e))
+        current_app.logger.error('/writeCuriosityAssessmentsStudentFeedback - EXCEPTION: {}'.format(e))
         return jsonify({"status": 500, "message": str(e)})
 
 
@@ -724,13 +720,13 @@ def getTopQuestions(user):
             return jsonify({"status": 400, "message": "No Data Found!!"})
 
     except Exception as e:
-        subject = "server:- {}, Error in /assessments/<assessment_id>".format(os.environ.get('FLASK_ENV'))
+        subject = "server:- {}, Error in /getCuriosityAssessmentsTopQuestions".format(os.environ.get('FLASK_ENV'))
         try:
             sg_client = SendGridAPIClient(os.environ.get('SENDGRID_API_KEY'))
             sg_client.send(Mail(from_email='noreply@edwisely.com', to_emails='alerts@edwisely.com', subject=subject, plain_text_content=str(e)))
         except Exception:
             pass
-        current_app.logger.error('/assessments/<assessment_id> - EXCEPTION: {}'.format(e))
+        current_app.logger.error('/getCuriosityAssessmentsTopQuestions - EXCEPTION: {}'.format(e))
         return jsonify({"status": 500, "message": str(e)})
 
 
@@ -759,13 +755,13 @@ def exportCuriosityAssessmentResults(user):
             return jsonify({"status": 400, "message": "No Data Found!!"})
 
     except Exception as e:
-        subject = "server:- {}, Error in /assessments/<assessment_id>".format(os.environ.get('FLASK_ENV'))
+        subject = "server:- {}, Error in /exportCuriosityAssessmentsResults".format(os.environ.get('FLASK_ENV'))
         try:
             sg_client = SendGridAPIClient(os.environ.get('SENDGRID_API_KEY'))
             sg_client.send(Mail(from_email='noreply@edwisely.com', to_emails='alerts@edwisely.com', subject=subject, plain_text_content=str(e)))
         except Exception:
             pass
-        current_app.logger.error('/assessments/<assessment_id> - EXCEPTION: {}'.format(e))
+        current_app.logger.error('/exportCuriosityAssessmentsResults - EXCEPTION: {}'.format(e))
         return jsonify({"status": 500, "message": str(e)})
 
 

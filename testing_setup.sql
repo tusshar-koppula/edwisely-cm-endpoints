@@ -130,7 +130,11 @@ CREATE TABLE curiosity_assessment (
     question_count         TINYINT      NOT NULL DEFAULT 3,
     duration_minutes       SMALLINT     NOT NULL DEFAULT 15,
     subject_code           VARCHAR(20)  DEFAULT NULL,
-    document_id            INT          DEFAULT NULL,
+    doc_name               VARCHAR(255) DEFAULT NULL,
+    doc_s3_key             VARCHAR(512) DEFAULT NULL,
+    doc_storage_url        TEXT         DEFAULT NULL,
+    doc_pages              SMALLINT     DEFAULT NULL,
+    doc_size_bytes         INT          DEFAULT NULL,
     rubric_relevance_limit TINYINT      NOT NULL DEFAULT 4,
     rubric_blooms_limit    TINYINT      NOT NULL DEFAULT 3,
     rubric_depth_limit     TINYINT      NOT NULL DEFAULT 3,
@@ -163,6 +167,7 @@ CREATE TABLE ca_has_students (
     status              ENUM('not_started','writing','submitted') NOT NULL DEFAULT 'not_started',
     submitted_at        DATETIME     DEFAULT NULL,
     time_elapsed_seconds INT         DEFAULT NULL,
+    started_at           DATETIME    DEFAULT NULL,
     avg_composite_score DECIMAL(4,2) DEFAULT NULL,
     avg_r_score         DECIMAL(4,2) DEFAULT NULL,
     avg_b_score         DECIMAL(4,2) DEFAULT NULL,
@@ -193,18 +198,6 @@ CREATE TABLE ca_question_submissions (
 -- Index required for the single-query JOIN and scalar subquery performance
 CREATE INDEX idx_ca_has_students_ca_id         ON ca_has_students(ca_id);
 CREATE INDEX idx_ca_question_submissions_ca_id  ON ca_question_submissions(ca_id);
-
-CREATE TABLE ca_documents (
-    doc_id      INT          NOT NULL AUTO_INCREMENT,
-    uploaded_by INT          NOT NULL,
-    name        VARCHAR(255) NOT NULL,
-    size_bytes  INT          NOT NULL,
-    pages       SMALLINT     NOT NULL,
-    s3_key      VARCHAR(512) NOT NULL,
-    storage_url TEXT         NOT NULL,
-    uploaded_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (doc_id)
-);
 
 CREATE TABLE ca_has_topics (
     ca_id    INT NOT NULL,
@@ -312,18 +305,14 @@ INSERT INTO student_section_mapping (id, student_id, section_id) VALUES
 (1, 201, 1), (2, 202, 1),
 (3, 203, 2), (4, 204, 2);
 
--- Document (for document-mode assessment)
-INSERT INTO ca_documents (doc_id, uploaded_by, name, size_bytes, pages, s3_key, storage_url, uploaded_at) VALUES
-(1, 101, 'DSA_Notes_Unit1.pdf', 204800, 12, 'ca_documents/101/seed__DSA_Notes_Unit1.pdf', 'https://edwisely-ca.s3.ap-south-1.amazonaws.com/ca_documents/101/seed__DSA_Notes_Unit1.pdf', '2026-06-01 10:00:00');
-
 -- ── Assessment 1: DRAFT ───────────────────────────────────────
 INSERT INTO curiosity_assessment
     (assmt_id, created_by, topic_source, assmt_title, assmt_brief, question_count, duration_minutes,
-     subject_code, document_id, rubric_relevance_limit, rubric_blooms_limit, rubric_depth_limit,
+     subject_code, rubric_relevance_limit, rubric_blooms_limit, rubric_depth_limit,
      status, start_time, end_time, is_deleted, created_at, updated_at)
 VALUES
 (1, 101, 'topic', 'DSA Quiz - Unit 1 Basics', 'Arrays and linked lists curiosity check.',
- 3, 15, 'CS201', NULL, 4, 3, 3, 'draft', NULL, NULL, 0,
+ 3, 15, 'CS201', 4, 3, 3, 'draft', NULL, NULL, 0,
  '2026-06-10 09:00:00', '2026-06-10 09:00:00');
 
 INSERT INTO ca_has_sections (ca_id, section_id) VALUES (1, 1), (1, 2);
@@ -333,13 +322,13 @@ INSERT INTO ca_has_topics   (ca_id, topic_id)   VALUES (1, 1), (1, 2);
 -- avg scores reflect Alice's 3 submitted questions (Bob is still writing)
 INSERT INTO curiosity_assessment
     (assmt_id, created_by, topic_source, assmt_title, assmt_brief, question_count, duration_minutes,
-     subject_code, document_id, rubric_relevance_limit, rubric_blooms_limit, rubric_depth_limit,
+     subject_code, rubric_relevance_limit, rubric_blooms_limit, rubric_depth_limit,
      status, start_time, end_time, is_deleted,
      avg_composite_score, avg_r_score, avg_b_score, avg_d_score,
      created_at, updated_at)
 VALUES
 (2, 101, 'topic', 'DSA Quiz - Trees and Graphs', 'Binary trees and graph traversal.',
- 3, 20, 'CS201', NULL, 4, 3, 3, 'live',
+ 3, 20, 'CS201', 4, 3, 3, 'live',
  '2026-06-12 08:00:00', '2026-06-12 23:59:00', 0,
  7.83, 8.33, 7.83, 7.33,
  '2026-06-11 18:00:00', '2026-06-12 08:00:00');
@@ -348,10 +337,11 @@ INSERT INTO ca_has_sections (ca_id, section_id) VALUES (2, 1);
 INSERT INTO ca_has_topics   (ca_id, topic_id)   VALUES (2, 3), (2, 4);
 
 -- avg scores for Alice: avg of her 3 question composite/dim scores
-INSERT INTO ca_has_students (ca_id, student_id, status, submitted_at, time_elapsed_seconds,
-    avg_composite_score, avg_r_score, avg_b_score, avg_d_score) VALUES
-(2, 201, 'submitted', '2026-06-12 09:30:00', 820,   7.83, 8.33, 7.83, 7.33),
-(2, 202, 'writing',   NULL,                  NULL,  NULL, NULL, NULL, NULL);
+INSERT INTO ca_has_students
+    (ca_id, student_id, status, submitted_at, time_elapsed_seconds, started_at,
+     avg_composite_score, avg_r_score, avg_b_score, avg_d_score) VALUES
+(2, 201, 'submitted', '2026-06-12 09:30:00', 820,  '2026-06-12 09:16:20', 7.83, 8.33, 7.83, 7.33),
+(2, 202, 'writing',   NULL,                  NULL, '2026-06-12 09:20:00', NULL, NULL, NULL, NULL);
 
 INSERT INTO ca_question_submissions (q_id, ca_id, student_id, question_number, question, r_score, b_score, d_score, composite_score, ai_feedback, submitted_at) VALUES
 (1, 2, 201, 1, 'How does in-order traversal work in a binary tree?',  8.5, 7.0, 7.5, 7.67, 'Good understanding. Mention edge cases.',           '2026-06-12 09:15:00'),
@@ -363,13 +353,18 @@ INSERT INTO ca_question_submissions (q_id, ca_id, student_id, question_number, q
 -- class avg across 3 submitted students (David is absent)
 INSERT INTO curiosity_assessment
     (assmt_id, created_by, topic_source, assmt_title, assmt_brief, question_count, duration_minutes,
-     subject_code, document_id, rubric_relevance_limit, rubric_blooms_limit, rubric_depth_limit,
+     doc_name, doc_s3_key, doc_storage_url, doc_pages, doc_size_bytes,
+     rubric_relevance_limit, rubric_blooms_limit, rubric_depth_limit,
      status, start_time, end_time, is_deleted,
      avg_composite_score, avg_r_score, avg_b_score, avg_d_score, median_time_seconds, score_distribution,
      created_at, updated_at)
 VALUES
 (3, 101, 'document', 'DSA Notes Assessment', 'Based on the uploaded DSA notes PDF.',
- 3, 15, NULL, 1, 4, 3, 3, 'ended',
+ 3, 15,
+ 'DSA_Notes_Unit1.pdf', 'ca_documents/101/seed__DSA_Notes_Unit1.pdf',
+ 'https://edwisely-ca.s3.ap-south-1.amazonaws.com/ca_documents/101/seed__DSA_Notes_Unit1.pdf',
+ 12, 204800,
+ 4, 3, 3, 'ended',
  '2026-06-05 09:00:00', '2026-06-05 11:00:00', 0,
  8.00, 8.28, 8.11, 7.61, 4200,
  '[{"band":"5-6","count":0},{"band":"6-7","count":0},{"band":"7-8","count":1},{"band":"8-9","count":2},{"band":"9-10","count":0}]',
@@ -377,12 +372,13 @@ VALUES
 
 INSERT INTO ca_has_sections (ca_id, section_id) VALUES (3, 1), (3, 2);
 
-INSERT INTO ca_has_students (ca_id, student_id, status, submitted_at, time_elapsed_seconds,
-    avg_composite_score, avg_r_score, avg_b_score, avg_d_score) VALUES
-(3, 201, 'submitted', '2026-06-05 09:45:00', 2700,  8.22, 8.50, 8.33, 7.83),
-(3, 202, 'submitted', '2026-06-05 10:10:00', 4200,  7.11, 7.33, 7.33, 6.67),
-(3, 203, 'submitted', '2026-06-05 10:30:00', 5400,  8.67, 9.00, 8.67, 8.33),
-(3, 204, 'not_started', NULL,                NULL,  NULL, NULL, NULL, NULL);
+INSERT INTO ca_has_students
+    (ca_id, student_id, status, submitted_at, time_elapsed_seconds, started_at,
+     avg_composite_score, avg_r_score, avg_b_score, avg_d_score) VALUES
+(3, 201, 'submitted', '2026-06-05 09:45:00', 2700, '2026-06-05 09:00:00', 8.22, 8.50, 8.33, 7.83),
+(3, 202, 'submitted', '2026-06-05 10:10:00', 4200, '2026-06-05 09:00:00', 7.11, 7.33, 7.33, 6.67),
+(3, 203, 'submitted', '2026-06-05 10:30:00', 5400, '2026-06-05 09:00:00', 8.67, 9.00, 8.67, 8.33),
+(3, 204, 'not_started', NULL,                NULL, NULL,                  NULL, NULL, NULL, NULL);
 
 INSERT INTO ca_question_submissions (q_id, ca_id, student_id, question_number, question, r_score, b_score, d_score, composite_score, ai_feedback, submitted_at) VALUES
 -- Alice (avg composite=8.22, r=8.50, b=8.33, d=7.83)
@@ -409,11 +405,11 @@ INSERT INTO ca_share (ca_id, scope, share_url, notified_emails, created_by, crea
 -- ── Assessment 4: SCHEDULED ───────────────────────────────────
 INSERT INTO curiosity_assessment
     (assmt_id, created_by, topic_source, assmt_title, assmt_brief, question_count, duration_minutes,
-     subject_code, document_id, rubric_relevance_limit, rubric_blooms_limit, rubric_depth_limit,
+     subject_code, rubric_relevance_limit, rubric_blooms_limit, rubric_depth_limit,
      status, start_time, end_time, is_deleted, created_at, updated_at)
 VALUES
 (4, 101, 'topic', 'Weekly Check - Graph Theory', 'Short check on graphs.',
- 2, 10, 'CS201', NULL, 4, 3, 3, 'scheduled',
+ 2, 10, 'CS201', 4, 3, 3, 'scheduled',
  '2026-06-15 09:00:00', '2026-06-15 11:00:00', 0,
  '2026-06-12 10:00:00', '2026-06-12 10:00:00');
 
@@ -441,9 +437,34 @@ INSERT INTO ca_similar_questions (source_q_id, question) VALUES
 -- ── Assessment 5: SOFT-DELETED ────────────────────────────────
 INSERT INTO curiosity_assessment
     (assmt_id, created_by, topic_source, assmt_title, assmt_brief, question_count, duration_minutes,
-     subject_code, document_id, rubric_relevance_limit, rubric_blooms_limit, rubric_depth_limit,
+     subject_code, rubric_relevance_limit, rubric_blooms_limit, rubric_depth_limit,
      status, start_time, end_time, is_deleted, created_at, updated_at)
 VALUES
 (5, 101, 'topic', 'Old Draft (Deleted)', 'Should not appear.',
- 3, 15, 'CS201', NULL, 4, 3, 3, 'draft', NULL, NULL, 1,
+ 3, 15, 'CS201', 4, 3, 3, 'draft', NULL, NULL, 1,
  '2026-06-01 10:00:00', '2026-06-01 10:00:00');
+
+
+-- -------------------------------------------------------
+-- PART D: Patches for getAssessmentStats() testing
+-- -------------------------------------------------------
+
+-- Fix end_time on the LIVE assessment so closes_in is meaningful
+UPDATE curiosity_assessment
+SET end_time = '2026-12-31 23:59:00'
+WHERE assmt_id = 2;
+
+-- Add started_at for LIVE assessment students (assmt_id = 2)
+-- Alice: submitted 09:30, elapsed 820s → started_at = 09:30 - 820s = 09:16:20
+-- Bob:   still writing, started at 09:20:00
+UPDATE ca_has_students SET started_at = '2026-06-12 09:16:20' WHERE ca_id = 2 AND student_id = 201;
+UPDATE ca_has_students SET started_at = '2026-06-12 09:20:00' WHERE ca_id = 2 AND student_id = 202;
+
+-- Add started_at for ENDED assessment students (assmt_id = 3)
+-- Alice: submitted 09:45, elapsed 2700s (45m) → started_at = 09:00:00
+-- Bob:   submitted 10:10, elapsed 4200s (70m) → started_at = 09:00:00
+-- Carol: submitted 10:30, elapsed 5400s (90m) → started_at = 09:00:00
+-- David: not_started → stays NULL
+UPDATE ca_has_students SET started_at = '2026-06-05 09:00:00' WHERE ca_id = 3 AND student_id = 201;
+UPDATE ca_has_students SET started_at = '2026-06-05 09:00:00' WHERE ca_id = 3 AND student_id = 202;
+UPDATE ca_has_students SET started_at = '2026-06-05 09:00:00' WHERE ca_id = 3 AND student_id = 203;

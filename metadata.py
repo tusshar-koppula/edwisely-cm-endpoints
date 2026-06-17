@@ -1,6 +1,6 @@
 from sqlalchemy import (
     Table, Column, Integer, String, MetaData, Text, DateTime,
-    SmallInteger, DECIMAL, TIMESTAMP, Enum, ForeignKey
+    SmallInteger, DECIMAL, TIMESTAMP, Enum, ForeignKey, JSON
 )
 
 metadata = MetaData()
@@ -10,7 +10,7 @@ metadata = MetaData()
 college_subject_mapping = Table('college_subject_mapping', metadata,
     Column('id', Integer, primary_key=True, autoincrement=True),
     Column('subject_semester_id', Integer, nullable=False),
-    Column('college_account_id', Integer, nullable=False),
+    Column('college_university_degree_department_id', Integer, nullable=False),
     Column('subject_id', Integer, nullable=True),
     Column('subject_code', String(20), nullable=True),
     Column('semester_id', Integer, nullable=True),
@@ -101,17 +101,6 @@ topic_co_mappings_cms = Table('topic_co_mappings_cms', metadata,
 
 # --- Curiosity Assessment Tables ---
 
-# Defined before curiosity_assessment because it is referenced by document_id FK
-ca_documents = Table('ca_documents', metadata,
-    Column('doc_id', Integer, primary_key=True, autoincrement=True),
-    Column('uploaded_by', Integer, nullable=False),
-    Column('name', String(255), nullable=False),
-    Column('size_bytes', Integer, nullable=False),
-    Column('pages', SmallInteger, nullable=False),
-    Column('storage_url', Text, nullable=False),
-    Column('uploaded_at', DateTime, nullable=False)
-)
-
 curiosity_assessment = Table('curiosity_assessment', metadata,
     Column('assmt_id', Integer, primary_key=True, autoincrement=True),
     Column('created_by', Integer, nullable=False),
@@ -121,7 +110,11 @@ curiosity_assessment = Table('curiosity_assessment', metadata,
     Column('question_count', SmallInteger, nullable=False, default=3),
     Column('duration_minutes', SmallInteger, nullable=False, default=15),
     Column('subject_code', String(20), nullable=True),
-    Column('document_id', Integer, ForeignKey('ca_documents.doc_id'), nullable=True),
+    Column('doc_name', String(255), nullable=True),
+    Column('doc_s3_key', String(512), nullable=True),
+    Column('doc_storage_url', Text, nullable=True),
+    Column('doc_pages', SmallInteger, nullable=True),
+    Column('doc_size_bytes', Integer, nullable=True),
     Column('rubric_relevance_limit', SmallInteger, nullable=False, default=4),
     Column('rubric_blooms_limit', SmallInteger, nullable=False, default=3),
     Column('rubric_depth_limit', SmallInteger, nullable=False, default=3),
@@ -135,7 +128,8 @@ curiosity_assessment = Table('curiosity_assessment', metadata,
     Column('created_at', DateTime, nullable=False),
     Column('updated_at', DateTime, nullable=False),
     Column('median_time_seconds', Integer, nullable=True),
-    Column('is_deleted', SmallInteger, nullable=False, default=0)
+    Column('is_deleted', SmallInteger, nullable=False, default=0),
+    Column('score_distribution', JSON, nullable=True)
 )
 
 ca_has_topics = Table('ca_has_topics', metadata,
@@ -156,9 +150,10 @@ ca_has_students = Table('ca_has_students', metadata,
     Column('avg_b_score', DECIMAL(3, 2), nullable=True),
     Column('avg_d_score', DECIMAL(3, 2), nullable=True),
     Column('avg_composite_score', DECIMAL(5, 2), nullable=True),
+    Column('started_at', DateTime, nullable=True),
     Column('submitted_at', DateTime, nullable=True),
     Column('time_elapsed_seconds', Integer, nullable=True),
-    Column('added_at', DateTime, nullable=False)
+    Column('added_at', DateTime, nullable=True)
 )
 
 ca_question_submissions = Table('ca_question_submissions', metadata,

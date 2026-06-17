@@ -205,6 +205,14 @@ def getAssessments(user_id, db, metadata, status=None, subject_code=None, sectio
     curiosity_assessment = metadata.tables['curiosity_assessment']
     ca_has_sections      = metadata.tables['ca_has_sections']
     ca_has_students      = metadata.tables['ca_has_students']
+    ca_has_topics        = metadata.tables['ca_has_topics']
+
+    topic_count_subq = (
+        select(func.count(ca_has_topics.c.topic_id))
+        .where(ca_has_topics.c.ca_id == curiosity_assessment.c.assmt_id)
+        .correlate(curiosity_assessment)
+        .scalar_subquery()
+    )
 
     # Base query — owned by this faculty, not deleted
     query = (
@@ -214,7 +222,6 @@ def getAssessments(user_id, db, metadata, status=None, subject_code=None, sectio
             curiosity_assessment.c.assmt_brief,
             curiosity_assessment.c.topic_source,
             curiosity_assessment.c.subject_code,
-            curiosity_assessment.c.document_id,
             curiosity_assessment.c.question_count,
             curiosity_assessment.c.duration_minutes,
             curiosity_assessment.c.rubric_relevance_limit,
@@ -229,7 +236,10 @@ def getAssessments(user_id, db, metadata, status=None, subject_code=None, sectio
             func.sum(
                 case((ca_has_students.c.status == 'submitted', 1), else_=0)
             ).label('submitted_count'),
-            curiosity_assessment.c.avg_composite_score.label('avg_score')
+            curiosity_assessment.c.avg_composite_score.label('avg_score'),
+            curiosity_assessment.c.doc_name,
+            curiosity_assessment.c.doc_pages,
+            topic_count_subq.label('topic_count'),
         )
         .select_from(
             curiosity_assessment
@@ -286,12 +296,18 @@ def getAssessments(user_id, db, metadata, status=None, subject_code=None, sectio
         section_ids = sections_by_assmt.get(row['assmt_id'], [])
 
         entry = OrderedDict()
+        source_kind = row['topic_source']
+
         entry['assmt_id']         = row['assmt_id']
         entry['title']            = row['assmt_title']
         entry['description']      = row['assmt_brief']
-        entry['source_kind']      = row['topic_source']
+        entry['source_kind']      = source_kind
         entry['subject_code']     = row['subject_code']
-        entry['document_id']      = row['document_id'] # document need to also come in this api, topic count key is missing, subject name
+        if source_kind == 'document':
+            entry['doc_name']  = row['doc_name']
+            entry['doc_pages'] = row['doc_pages']
+        elif source_kind == 'topic':
+            entry['topic_count'] = int(row['topic_count'] or 0)
         entry['question_count']   = row['question_count']
         entry['duration_minutes'] = row['duration_minutes']
         entry['rubric']           = {
@@ -379,7 +395,11 @@ def duplicateAssessment(user_id, db, metadata, assmt_id):
                 question_count   = src['question_count'],
                 duration_minutes = src['duration_minutes'],
                 subject_code     = src['subject_code'],
-                document_id      = src['document_id'],
+                doc_name         = src['doc_name'],
+                doc_s3_key       = src['doc_s3_key'],
+                doc_storage_url  = src['doc_storage_url'],
+                doc_pages        = src['doc_pages'],
+                doc_size_bytes   = src['doc_size_bytes'],
                 rubric_relevance_limit = src['rubric_relevance_limit'],
                 rubric_blooms_limit    = src['rubric_blooms_limit'],
                 rubric_depth_limit     = src['rubric_depth_limit'],
@@ -833,6 +853,7 @@ def getDepartments(user_id, db, metadata):
                 department_new.c.id == university_degree_department_new.c.department_id)
             .outerjoin(college_department_section_new,
                 and_(
+                    college_department_section_new.c.department_id == department_new.c.id,
                     college_department_section_new.c.active == 1,
                     college_department_section_new.c.test == 0
                 ))
@@ -938,8 +959,6 @@ def getStudents(user_id, db, metadata, role, section_id=None, q=None):
 
 
 def uploadDocument(user_id, db, metadata, file):
-    ca_documents = metadata.tables['ca_documents']
-
     filename   = file.filename
     file_bytes = file.read()
     size_bytes = len(file_bytes)
@@ -951,34 +970,23 @@ def uploadDocument(user_id, db, metadata, file):
         io.BytesIO(file_bytes),
         _S3_BUCKET,
         s3_key,
-        ExtraArgs={'ACL': 'public-read', 'ContentType': 'application/pdf'}
+        ExtraArgs={'ContentType': 'application/pdf'}
     )
     storage_url = 'https://{}.s3.{}.amazonaws.com/{}'.format(
         _S3_BUCKET, os.environ.get('AWS_REGION'), s3_key
     )
 
-    result = db.execute(
-        ca_documents.insert().values(
-            uploaded_by = user_id,
-            name        = filename,
-            size_bytes  = size_bytes,
-            pages       = pages,
-            s3_key      = s3_key,
-            storage_url = storage_url,
-            uploaded_at = _utcnow()
-        )
-    )
-
     return OrderedDict([
-        ('document_id', result.lastrowid),
-        ('name',        filename),
-        ('size',        size_bytes),
-        ('pages',       pages)
+        ('doc_name',        filename),
+        ('doc_s3_key',      s3_key),
+        ('doc_storage_url', storage_url),
+        ('doc_pages',       pages),
+        ('doc_size_bytes',  size_bytes)
     ])
 
 
 def createAssessment(user_id, db, metadata,
-                     title, description, source_kind, document_id, topic_ids,
+                     title, description, source_kind, doc_info, topic_ids,
                      subject_code, recipients, question_count, duration_minutes,
                      start_time, end_time, rubric, status):
 
@@ -1008,7 +1016,11 @@ def createAssessment(user_id, db, metadata,
                 question_count   = question_count,
                 duration_minutes = duration_minutes,
                 subject_code     = subject_code if source_kind == 'topic' else None,
-                document_id      = document_id  if source_kind == 'document' else None,
+                doc_name         = doc_info['doc_name']        if source_kind == 'document' and doc_info else None,
+                doc_s3_key       = doc_info['doc_s3_key']      if source_kind == 'document' and doc_info else None,
+                doc_storage_url  = doc_info['doc_storage_url'] if source_kind == 'document' and doc_info else None,
+                doc_pages        = doc_info['doc_pages']       if source_kind == 'document' and doc_info else None,
+                doc_size_bytes   = doc_info['doc_size_bytes']  if source_kind == 'document' and doc_info else None,
                 rubric_relevance_limit = rubric['relevance'] if rubric else None,
                 rubric_blooms_limit    = rubric['blooms']    if rubric else None,
                 rubric_depth_limit     = rubric['depth']     if rubric else None,
@@ -1069,7 +1081,7 @@ def createAssessment(user_id, db, metadata,
 
 
 def updateAssessment(user_id, db, metadata, assmt_id,
-                     title, description, source_kind, document_id, topic_ids,
+                     title, description, source_kind, doc_info, topic_ids,
                      subject_code, recipients, question_count, duration_minutes,
                      start_time, end_time, rubric, status):
 
@@ -1078,7 +1090,6 @@ def updateAssessment(user_id, db, metadata, assmt_id,
     ca_has_topics           = metadata.tables['ca_has_topics']
     ca_has_students         = metadata.tables['ca_has_students']
     student_section_mapping = metadata.tables['student_section_mapping']
-    ca_documents            = metadata.tables['ca_documents']
 
     if not _checkAccess(user_id, assmt_id, db, metadata):
         return None
@@ -1089,7 +1100,7 @@ def updateAssessment(user_id, db, metadata, assmt_id,
             curiosity_assessment.c.start_time,
             curiosity_assessment.c.end_time,
             curiosity_assessment.c.topic_source,
-            curiosity_assessment.c.document_id,
+            curiosity_assessment.c.doc_s3_key,
             curiosity_assessment.c.subject_code,
             curiosity_assessment.c.question_count,
             curiosity_assessment.c.duration_minutes,
@@ -1107,23 +1118,14 @@ def updateAssessment(user_id, db, metadata, assmt_id,
         return None
 
     current_status = current['status']
-    old_doc_id     = current['document_id']
+    old_s3_key     = current['doc_s3_key']
 
     # Detect if the existing document will be orphaned after this update:
-    # — new file uploaded (document_id replaced), or
-    # — switching source_kind to 'topic' (document_id cleared to None)
-    will_orphan_doc = old_doc_id is not None and (
-        (document_id is not None and document_id != old_doc_id) or
-        source_kind == 'topic'
+    # — new file uploaded (doc_info provided), or
+    # — switching source_kind to 'topic' (doc columns cleared to None)
+    will_orphan_doc = old_s3_key is not None and (
+        doc_info is not None or source_kind == 'topic'
     )
-    old_s3_key = None
-    if will_orphan_doc:
-        old_doc_row = db.execute(
-            select(ca_documents.c.s3_key)
-            .where(ca_documents.c.doc_id == old_doc_id)
-        ).mappings().first()
-        if old_doc_row:
-            old_s3_key = old_doc_row['s3_key']
 
     # Validate status transition
     ALLOWED_TRANSITIONS = {
@@ -1142,7 +1144,12 @@ def updateAssessment(user_id, db, metadata, assmt_id,
     if title            is not None: values['assmt_title']      = title
     if description      is not None: values['assmt_brief']      = description
     if source_kind      is not None: values['topic_source']     = source_kind
-    if document_id      is not None: values['document_id']      = document_id
+    if doc_info is not None:
+        values['doc_name']        = doc_info['doc_name']
+        values['doc_s3_key']      = doc_info['doc_s3_key']
+        values['doc_storage_url'] = doc_info['doc_storage_url']
+        values['doc_pages']       = doc_info['doc_pages']
+        values['doc_size_bytes']  = doc_info['doc_size_bytes']
     if subject_code     is not None: values['subject_code']     = subject_code
     if question_count   is not None: values['question_count']   = question_count
     if duration_minutes is not None: values['duration_minutes'] = duration_minutes
@@ -1153,15 +1160,16 @@ def updateAssessment(user_id, db, metadata, assmt_id,
         values['rubric_relevance_limit'] = rubric['relevance']
         values['rubric_blooms_limit']    = rubric['blooms']
         values['rubric_depth_limit']     = rubric['depth']
-    # If transitioning back to draft, clear window times
-    if status == 'draft':
-        values['start_time'] = None
-        values['end_time']   = None
-    # When switching source_kind, clear the opposing field so stale data doesn't persist
+
+    # When switching source_kind, clear the opposing fields so stale data doesn't persist
     if source_kind == 'document':
         values['subject_code'] = None
     elif source_kind == 'topic':
-        values['document_id']  = None
+        values['doc_name']        = None
+        values['doc_s3_key']      = None
+        values['doc_storage_url'] = None
+        values['doc_pages']       = None
+        values['doc_size_bytes']  = None
 
     # Validate effective time window — compare incoming values against existing DB times
     effective_start = values.get('start_time', current['start_time'])
@@ -1172,15 +1180,15 @@ def updateAssessment(user_id, db, metadata, assmt_id,
     # Completeness check when transitioning to live/scheduled — merge incoming with current DB state
     if status in ('live', 'scheduled'):
         eff_source_kind    = values.get('topic_source',          current['topic_source'])
-        eff_document_id    = values.get('document_id',           current['document_id'])
+        eff_doc_s3_key     = values.get('doc_s3_key',            current['doc_s3_key'])
         eff_subject_code   = values.get('subject_code',          current['subject_code'])
         eff_question_count = values.get('question_count',        current['question_count'])
         eff_duration       = values.get('duration_minutes',      current['duration_minutes'])
         eff_rubric         = values.get('rubric_relevance_limit', current['rubric_relevance_limit'])
 
         missing = []
-        if not eff_source_kind:                                   missing.append('source_kind')
-        if eff_source_kind == 'document' and not eff_document_id: missing.append('file/document')
+        if not eff_source_kind:                                    missing.append('source_kind')
+        if eff_source_kind == 'document' and not eff_doc_s3_key:  missing.append('file/document')
         if eff_source_kind == 'topic':
             if not eff_subject_code:                              missing.append('subject_code')
             has_topics = topic_ids or db.execute(
@@ -1297,14 +1305,6 @@ def updateAssessment(user_id, db, metadata, assmt_id,
                 .where(ca_has_topics.c.ca_id == assmt_id)
             )
 
-        # Remove orphaned ca_documents row inside the transaction so the
-        # DB stays consistent even if the S3 delete below fails.
-        if will_orphan_doc:
-            db.execute(
-                ca_documents.delete()
-                .where(ca_documents.c.doc_id == old_doc_id)
-            )
-
         db.commit()
     except Exception:
         db.rollback()
@@ -1349,7 +1349,11 @@ def _fetchAssessmentById(assmt_id, db, metadata):
     result['description']      = row['assmt_brief']
     result['source_kind']      = row['topic_source']
     result['subject_code']     = row['subject_code']
-    result['document_id']      = row['document_id']
+    result['doc_name']         = row['doc_name']
+    result['doc_s3_key']       = row['doc_s3_key']
+    result['doc_storage_url']  = row['doc_storage_url']
+    result['doc_pages']        = row['doc_pages']
+    result['doc_size_bytes']   = row['doc_size_bytes']
     result['question_count']   = row['question_count']
     result['duration_minutes'] = row['duration_minutes']
     result['rubric']           = {
@@ -1377,7 +1381,6 @@ def getAssessmentByID(user_id, db, metadata, assmt_id):
     student_section_mapping        = metadata.tables['student_section_mapping']
     ca_has_topics                  = metadata.tables['ca_has_topics']
     subject_topic_mappings         = metadata.tables['subject_topic_mappings']
-    ca_documents                   = metadata.tables['ca_documents']
 
     if not _checkAccess(user_id, assmt_id, db, metadata):
         return None
@@ -1391,7 +1394,7 @@ def getAssessmentByID(user_id, db, metadata, assmt_id):
     )
 
     # Query 1 — assessment + sections + document (document join adds 0 extra rows: 1-to-1).
-    # For topic-mode assessments, document columns will all be NULL (no document_id).
+    # For topic-mode assessments, doc columns will all be NULL.
     rows = db.execute(
         select(
             curiosity_assessment.c.assmt_id,
@@ -1399,7 +1402,6 @@ def getAssessmentByID(user_id, db, metadata, assmt_id):
             curiosity_assessment.c.assmt_brief,
             curiosity_assessment.c.topic_source,
             curiosity_assessment.c.subject_code,
-            curiosity_assessment.c.document_id,
             curiosity_assessment.c.question_count,
             curiosity_assessment.c.duration_minutes,
             curiosity_assessment.c.rubric_relevance_limit,
@@ -1412,10 +1414,10 @@ def getAssessmentByID(user_id, db, metadata, assmt_id):
             college_department_section_new.c.id.label('section_id'),
             college_department_section_new.c.section_name,
             student_count_subq.label('section_student_count'),
-            ca_documents.c.name.label('doc_name'),
-            ca_documents.c.size_bytes.label('doc_size_bytes'),
-            ca_documents.c.pages.label('doc_pages'),
-            ca_documents.c.storage_url.label('doc_url'),
+            curiosity_assessment.c.doc_name,
+            curiosity_assessment.c.doc_size_bytes,
+            curiosity_assessment.c.doc_pages,
+            curiosity_assessment.c.doc_storage_url.label('doc_url'),
         )
         .select_from(
             curiosity_assessment
@@ -1423,8 +1425,6 @@ def getAssessmentByID(user_id, db, metadata, assmt_id):
                 ca_has_sections.c.ca_id == curiosity_assessment.c.assmt_id)
             .outerjoin(college_department_section_new,
                 college_department_section_new.c.id == ca_has_sections.c.section_id)
-            .outerjoin(ca_documents,
-                ca_documents.c.doc_id == curiosity_assessment.c.document_id)
         )
         .where(
             and_(
@@ -1459,12 +1459,11 @@ def getAssessmentByID(user_id, db, metadata, assmt_id):
     # Build syllabus — document mode: already in query 1 (no extra roundtrip)
     if topic_source == 'document':
         syllabus = OrderedDict([
-            ('document_id', first['document_id']),
             ('name',        first['doc_name']),
             ('size_bytes',  first['doc_size_bytes']),
             ('pages',       first['doc_pages']),
             ('url',         first['doc_url']),
-        ]) if first['document_id'] else None
+        ]) if first['doc_name'] else None
 
     elif topic_source == 'topic':
         # topic mode — Query 2: join ca_has_topics → subject_topic_mappings directly.
@@ -1542,7 +1541,6 @@ def getAssessmentStats(user_id, db, metadata, assmt_id, sort=None):
     college_account_new            = metadata.tables['college_account_new']
     ca_has_sections                = metadata.tables['ca_has_sections']
     college_department_section_new = metadata.tables['college_department_section_new']
-    ca_documents                   = metadata.tables['ca_documents']
     ca_has_topics                  = metadata.tables['ca_has_topics']
     subject_topic_mappings         = metadata.tables['subject_topic_mappings']
     college_subject_mapping        = metadata.tables['college_subject_mapping']
@@ -1587,6 +1585,9 @@ def getAssessmentStats(user_id, db, metadata, assmt_id, sort=None):
             curiosity_assessment.c.assmt_title,
             curiosity_assessment.c.topic_source,
             curiosity_assessment.c.subject_code,
+            curiosity_assessment.c.doc_name,
+            curiosity_assessment.c.doc_storage_url,
+            curiosity_assessment.c.doc_pages,
             curiosity_assessment.c.question_count,
             curiosity_assessment.c.duration_minutes,
             curiosity_assessment.c.status,
@@ -1706,25 +1707,11 @@ def getAssessmentStats(user_id, db, metadata, assmt_id, sort=None):
 
     # Syllabus block — shape depends on topic_source
     if topic_source == 'document':
-        doc_row = db.execute(
-            select(
-                ca_documents.c.name.label('doc_name'),
-                ca_documents.c.storage_url.label('doc_url'),
-                ca_documents.c.pages
-            )
-            .select_from(
-                curiosity_assessment
-                .join(ca_documents,
-                    ca_documents.c.doc_id == curiosity_assessment.c.document_id)
-            )
-            .where(curiosity_assessment.c.assmt_id == assmt_id)
-        ).mappings().first()
-
         syllabus = OrderedDict([
             ('source_kind', 'document'),
-            ('name',        doc_row['doc_name']  if doc_row else None),
-            ('url',         doc_row['doc_url']   if doc_row else None),  # TODO: replace with S3 pre-signed URL
-            ('pages',       doc_row['pages']     if doc_row else None)
+            ('name',        first['doc_name']),
+            ('url',         first['doc_storage_url']),
+            ('pages',       first['doc_pages'])
         ])
 
     else:
@@ -1791,14 +1778,14 @@ def getAssessmentStats(user_id, db, metadata, assmt_id, sort=None):
             select(curiosity_assessment.c.avg_composite_score.label('prev_avg'))
             .where(
                 and_(
-                    curiosity_assessment.c.created_by == user_id,
-                    curiosity_assessment.c.status == 'ended',
-                    curiosity_assessment.c.assmt_id != assmt_id,
-                    curiosity_assessment.c.avg_composite_score.isnot(None)
+                    curiosity_assessment.c.created_by == user_id, # the same creator
+                    curiosity_assessment.c.status == 'ended', # must be a finished assessment
+                    curiosity_assessment.c.assmt_id != assmt_id, # not the current assessment
+                    curiosity_assessment.c.avg_composite_score.isnot(None) # must have an avg composite score
                 )
             )
-            .order_by(curiosity_assessment.c.updated_at.desc())
-            .limit(1)
+            .order_by(curiosity_assessment.c.updated_at.desc()) 
+            .limit(1) # fetches the latest ended assessment (of that creator)
         ).mappings().first()
 
         if prev_row and avg_score is not None:
@@ -1807,7 +1794,7 @@ def getAssessmentStats(user_id, db, metadata, assmt_id, sort=None):
             score_vs_last = OrderedDict([
                 ('previous_avg', prev_avg),
                 ('delta',        delta),
-                ('direction',    'up' if delta > 0 else ('down' if delta < 0 else 'same'))
+                #('direction',    'up' if delta > 0 else ('down' if delta < 0 else 'same'))
             ])
         else:
             score_vs_last = None
@@ -1846,89 +1833,6 @@ def getAssessmentStats(user_id, db, metadata, assmt_id, sort=None):
         ])),
         ('students', students)
     ])
-
-
-def getAssessmentRoster(user_id, db, metadata, assmt_id, status=None, sort=None):
-    curiosity_assessment    = metadata.tables['curiosity_assessment']
-    ca_has_students         = metadata.tables['ca_has_students']
-    ca_question_submissions = metadata.tables['ca_question_submissions']
-    college_account_new     = metadata.tables['college_account_new']
-
-    if not _checkAccess(user_id, assmt_id, db, metadata):
-        return None
-
-    # Translate hyphenated frontend value to DB column value before query
-    db_status = None
-    if status and status != 'all':
-        db_status = 'not_started' if status == 'not-started' else status
-
-    query = (
-        select(
-            ca_has_students.c.student_id,
-            ca_has_students.c.status,
-            ca_has_students.c.submitted_at,
-            college_account_new.c.name.label('student_name'),
-            college_account_new.c.roll_number.label('roll'),
-            func.count(distinct(ca_question_submissions.c.q_id)).label('q_count'),
-            ca_has_students.c.avg_composite_score.label('avg_score'),
-            curiosity_assessment.c.question_count
-        )
-        .select_from(
-            ca_has_students
-            .join(college_account_new,
-                college_account_new.c.id == ca_has_students.c.student_id)
-            .outerjoin(ca_question_submissions,
-                and_(
-                    ca_question_submissions.c.ca_id == ca_has_students.c.ca_id,
-                    ca_question_submissions.c.student_id == ca_has_students.c.student_id
-                ))
-            .join(curiosity_assessment,
-                curiosity_assessment.c.assmt_id == ca_has_students.c.ca_id)
-        )
-        .where(and_(
-            ca_has_students.c.ca_id == assmt_id,
-            *([ca_has_students.c.status == db_status] if db_status else [])
-        ))
-        .group_by(
-            ca_has_students.c.student_id,
-            ca_has_students.c.status,
-            ca_has_students.c.submitted_at,
-            college_account_new.c.id,
-            curiosity_assessment.c.question_count
-        )
-    )
-
-    sort_map = {
-        'score-desc': ca_has_students.c.avg_composite_score.desc(),
-        'score-asc':  ca_has_students.c.avg_composite_score.asc(),
-        'name-asc':   college_account_new.c.name.asc(),
-        'name-desc':  college_account_new.c.name.desc(),
-        'time-asc':   ca_has_students.c.submitted_at.asc()
-    }
-    order = sort_map.get(sort, college_account_new.c.name.asc())
-    query = query.order_by(order)
-
-    rows = db.execute(query).mappings().all()
-    if not rows:
-        return None
-
-    roster = []
-    for row in rows:
-        total_questions = row['question_count']
-        score = round(float(row['avg_score']) * total_questions / 10, 2) \
-            if row['avg_score'] else None
-        roster.append(OrderedDict([
-            ('student_id',   row['student_id']),
-            ('student_name', row['student_name']),
-            ('roll',         row['roll']),
-            ('status',       row['status']),
-            ('submitted_at', row['submitted_at'].isoformat() if row['submitted_at'] else None),
-            ('q_count',      int(row['q_count'])),
-            ('q_total',      total_questions),
-            ('score',        score)
-        ]))
-
-    return roster
 
 
 def getStudentQuestions(user_id, db, metadata, assmt_id, student_id):
@@ -2051,38 +1955,6 @@ def getTopQuestions(user_id, db, metadata, assmt_id):
     ]
 
 
-def getAssessmentDocument(user_id, db, metadata, assmt_id, created_by=None):
-    curiosity_assessment = metadata.tables['curiosity_assessment']
-    ca_documents         = metadata.tables['ca_documents']
-
-    row = db.execute(
-        select(
-            ca_documents.c.doc_id,
-            ca_documents.c.name,
-            ca_documents.c.size_bytes,
-            ca_documents.c.pages,
-            ca_documents.c.storage_url
-        )
-        .select_from(
-            curiosity_assessment
-            .join(ca_documents,
-                ca_documents.c.doc_id == curiosity_assessment.c.document_id)
-        )
-        .where(curiosity_assessment.c.assmt_id == assmt_id)
-    ).mappings().first()
-
-    if not row:
-        return None
-
-    return OrderedDict([
-        ('document_id',  row['doc_id']),
-        ('name',         row['name']),
-        ('size',         row['size_bytes']),
-        ('pages',        row['pages']),
-        ('url',          row['storage_url'])
-    ])
-
-
 def getAssessmentTopics(db, metadata, assmt_id):
     curiosity_assessment   = metadata.tables['curiosity_assessment']
     ca_has_topics          = metadata.tables['ca_has_topics']
@@ -2155,7 +2027,23 @@ def getAssessmentSyllabus(user_id, db, metadata, assmt_id):
         return None
 
     if assmt['topic_source'] == 'document':
-        return getAssessmentDocument(user_id, db, metadata, assmt_id, created_by=assmt['created_by'])
+        doc_row = db.execute(
+            select(
+                curiosity_assessment.c.doc_name,
+                curiosity_assessment.c.doc_size_bytes,
+                curiosity_assessment.c.doc_pages,
+                curiosity_assessment.c.doc_storage_url
+            )
+            .where(curiosity_assessment.c.assmt_id == assmt_id)
+        ).mappings().first()
+        if not doc_row or not doc_row['doc_name']:
+            return None
+        return OrderedDict([
+            ('name',       doc_row['doc_name']),
+            ('size_bytes', doc_row['doc_size_bytes']),
+            ('pages',      doc_row['doc_pages']),
+            ('url',        doc_row['doc_storage_url'])
+        ])
     return getAssessmentTopics(db, metadata, assmt_id)
 
 
@@ -2425,7 +2313,7 @@ def exportAssessment(user_id, db, metadata, assmt_id, fmt, columns):
         'section':         ('Section',             lambda r: r['section']),
         'total_score':     ('Total Score',         lambda r: round(float(r['total_score']), 2) if r['total_score'] else None),
         'relevance_pct':   ('Relevance %',         lambda r: round(float(r['avg_relevance']), 2) if r['avg_relevance'] else None),
-        'blooms_level':    ("Bloom's Level",        lambda r: round(float(r['avg_blooms']), 2) if r['avg_blooms'] else None),
+        'blooms_level':    ("Bloom's Level",       lambda r: round(float(r['avg_blooms']), 2) if r['avg_blooms'] else None),
         'depth':           ('Depth',               lambda r: round(float(r['avg_depth']), 2) if r['avg_depth'] else None),
         'q_submitted':     ('Questions Submitted', lambda r: int(r['q_submitted'])),
         'submission_time': ('Submission Time',     lambda r: r['submitted_at'].isoformat() if r['submitted_at'] else None),
