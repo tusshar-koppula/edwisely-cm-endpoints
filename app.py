@@ -24,6 +24,9 @@ def close_db(exception=None):
 from curiosity_assessment_endpoints import curiosity_assessment
 app.register_blueprint(curiosity_assessment)
 
+from curiosity_assessment_student_API_endpoints import curiosity_student
+app.register_blueprint(curiosity_student)
+
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':

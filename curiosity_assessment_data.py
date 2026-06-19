@@ -6,8 +6,10 @@ import json
 import os
 import uuid
 import io
+import threading
 import boto3
 from pypdf import PdfReader
+from openai import OpenAI
 
 _s3 = boto3.client(
     's3',
@@ -16,6 +18,8 @@ _s3 = boto3.client(
     aws_secret_access_key= os.environ.get('AWS_SECRET_ACCESS_KEY')
 )
 _S3_BUCKET = os.environ.get('S3_BUCKET_NAME')
+
+_openai = OpenAI(api_key=os.environ.get('OPENAI_API_KEY'))
 
 
 # ============================================================
@@ -220,7 +224,7 @@ def getAssessments(user_id, db, metadata, status=None, subject_code=None, sectio
             curiosity_assessment.c.assmt_id,
             curiosity_assessment.c.assmt_title,
             curiosity_assessment.c.assmt_brief,
-            curiosity_assessment.c.topic_source,
+            curiosity_assessment.c.source_kind,
             curiosity_assessment.c.subject_code,
             curiosity_assessment.c.question_count,
             curiosity_assessment.c.duration_minutes,
@@ -296,7 +300,7 @@ def getAssessments(user_id, db, metadata, status=None, subject_code=None, sectio
         section_ids = sections_by_assmt.get(row['assmt_id'], [])
 
         entry = OrderedDict()
-        source_kind = row['topic_source']
+        source_kind = row['source_kind']
 
         entry['assmt_id']         = row['assmt_id']
         entry['title']            = row['assmt_title']
@@ -389,7 +393,7 @@ def duplicateAssessment(user_id, db, metadata, assmt_id):
         result = db.execute(
             curiosity_assessment.insert().values(
                 created_by       = user_id,
-                topic_source     = src['topic_source'],
+                source_kind     = src['source_kind'],
                 assmt_title      = src['assmt_title'] + ' (Copy)',
                 assmt_brief      = src['assmt_brief'],
                 question_count   = src['question_count'],
@@ -958,6 +962,20 @@ def getStudents(user_id, db, metadata, role, section_id=None, q=None):
     return list(sections_dict.values())
 
 
+def _ingest_to_vector_store(vector_store_id, file_bytes, filename):
+    try:
+        file_obj = _openai.files.create(
+            file=(filename, io.BytesIO(file_bytes), 'application/pdf'),
+            purpose='assistants'
+        )
+        _openai.vector_stores.files.create(
+            vector_store_id=vector_store_id,
+            file_id=file_obj.id
+        )
+    except Exception:
+        pass
+
+
 def uploadDocument(user_id, db, metadata, file):
     filename   = file.filename
     file_bytes = file.read()
@@ -976,12 +994,27 @@ def uploadDocument(user_id, db, metadata, file):
         _S3_BUCKET, os.environ.get('AWS_REGION'), s3_key
     )
 
+    # Create vector store synchronously (fast API call) — get ID to persist in DB
+    vs = _openai.vector_stores.create(
+        name='ca_doc_{}'.format(uuid.uuid4().hex[:8]),
+        expires_after={'anchor': 'last_active_at', 'days': 365},
+    )
+    vector_store_id = vs.id
+
+    # Upload PDF content to vector store in background — chunking/indexing takes time
+    threading.Thread(
+        target=_ingest_to_vector_store,
+        args=(vector_store_id, file_bytes, filename),
+        daemon=True
+    ).start()
+
     return OrderedDict([
         ('doc_name',        filename),
         ('doc_s3_key',      s3_key),
         ('doc_storage_url', storage_url),
         ('doc_pages',       pages),
-        ('doc_size_bytes',  size_bytes)
+        ('doc_size_bytes',  size_bytes),
+        ('vector_store_id', vector_store_id)
     ])
 
 
@@ -1010,7 +1043,7 @@ def createAssessment(user_id, db, metadata,
         result = db.execute(
             curiosity_assessment.insert().values(
                 created_by       = user_id,
-                topic_source     = source_kind,
+                source_kind     = source_kind,
                 assmt_title      = title,
                 assmt_brief      = description,
                 question_count   = question_count,
@@ -1021,6 +1054,7 @@ def createAssessment(user_id, db, metadata,
                 doc_storage_url  = doc_info['doc_storage_url'] if source_kind == 'document' and doc_info else None,
                 doc_pages        = doc_info['doc_pages']       if source_kind == 'document' and doc_info else None,
                 doc_size_bytes   = doc_info['doc_size_bytes']  if source_kind == 'document' and doc_info else None,
+                vector_store_id  = doc_info['vector_store_id'] if source_kind == 'document' and doc_info else None,
                 rubric_relevance_limit = rubric['relevance'] if rubric else None,
                 rubric_blooms_limit    = rubric['blooms']    if rubric else None,
                 rubric_depth_limit     = rubric['depth']     if rubric else None,
@@ -1099,8 +1133,9 @@ def updateAssessment(user_id, db, metadata, assmt_id,
             curiosity_assessment.c.status,
             curiosity_assessment.c.start_time,
             curiosity_assessment.c.end_time,
-            curiosity_assessment.c.topic_source,
+            curiosity_assessment.c.source_kind,
             curiosity_assessment.c.doc_s3_key,
+            curiosity_assessment.c.vector_store_id,
             curiosity_assessment.c.subject_code,
             curiosity_assessment.c.question_count,
             curiosity_assessment.c.duration_minutes,
@@ -1143,13 +1178,14 @@ def updateAssessment(user_id, db, metadata, assmt_id,
     values = {'updated_at': _utcnow()}
     if title            is not None: values['assmt_title']      = title
     if description      is not None: values['assmt_brief']      = description
-    if source_kind      is not None: values['topic_source']     = source_kind
+    if source_kind      is not None: values['source_kind']     = source_kind
     if doc_info is not None:
         values['doc_name']        = doc_info['doc_name']
         values['doc_s3_key']      = doc_info['doc_s3_key']
         values['doc_storage_url'] = doc_info['doc_storage_url']
         values['doc_pages']       = doc_info['doc_pages']
         values['doc_size_bytes']  = doc_info['doc_size_bytes']
+        values['vector_store_id'] = doc_info['vector_store_id']
     if subject_code     is not None: values['subject_code']     = subject_code
     if question_count   is not None: values['question_count']   = question_count
     if duration_minutes is not None: values['duration_minutes'] = duration_minutes
@@ -1170,6 +1206,7 @@ def updateAssessment(user_id, db, metadata, assmt_id,
         values['doc_storage_url'] = None
         values['doc_pages']       = None
         values['doc_size_bytes']  = None
+        values['vector_store_id'] = None
 
     # Validate effective time window — compare incoming values against existing DB times
     effective_start = values.get('start_time', current['start_time'])
@@ -1179,7 +1216,7 @@ def updateAssessment(user_id, db, metadata, assmt_id,
 
     # Completeness check when transitioning to live/scheduled — merge incoming with current DB state
     if status in ('live', 'scheduled'):
-        eff_source_kind    = values.get('topic_source',          current['topic_source'])
+        eff_source_kind    = values.get('source_kind',          current['source_kind'])
         eff_doc_s3_key     = values.get('doc_s3_key',            current['doc_s3_key'])
         eff_subject_code   = values.get('subject_code',          current['subject_code'])
         eff_question_count = values.get('question_count',        current['question_count'])
@@ -1310,11 +1347,18 @@ def updateAssessment(user_id, db, metadata, assmt_id,
         db.rollback()
         raise
 
-    # S3 delete is best-effort after commit — an orphaned object is acceptable;
-    # a failed DB commit with a deleted S3 object is not.
+    # S3 + vector store deletes are best-effort after commit — orphaned objects are
+    # acceptable; a failed DB commit with already-deleted resources is not.
     if old_s3_key:
         try:
             _s3.delete_object(Bucket=_S3_BUCKET, Key=old_s3_key)
+        except Exception:
+            pass
+
+    old_vector_store_id = current['vector_store_id']
+    if old_vector_store_id and (doc_info is not None or source_kind == 'topic'):
+        try:
+            _openai.vector_stores.delete(old_vector_store_id)
         except Exception:
             pass
 
@@ -1347,7 +1391,7 @@ def _fetchAssessmentById(assmt_id, db, metadata):
     result['assmt_id']         = row['assmt_id']
     result['title']            = row['assmt_title']
     result['description']      = row['assmt_brief']
-    result['source_kind']      = row['topic_source']
+    result['source_kind']      = row['source_kind']
     result['subject_code']     = row['subject_code']
     result['doc_name']         = row['doc_name']
     result['doc_s3_key']       = row['doc_s3_key']
@@ -1400,7 +1444,7 @@ def getAssessmentByID(user_id, db, metadata, assmt_id):
             curiosity_assessment.c.assmt_id,
             curiosity_assessment.c.assmt_title,
             curiosity_assessment.c.assmt_brief,
-            curiosity_assessment.c.topic_source,
+            curiosity_assessment.c.source_kind,
             curiosity_assessment.c.subject_code,
             curiosity_assessment.c.question_count,
             curiosity_assessment.c.duration_minutes,
@@ -1440,7 +1484,7 @@ def getAssessmentByID(user_id, db, metadata, assmt_id):
 
     first        = rows[0]
     status       = first['status']
-    topic_source = first['topic_source']
+    source_kind = first['source_kind']
 
     # Guard: only draft / scheduled can be opened for editing
     if status not in ('draft', 'scheduled'):
@@ -1457,7 +1501,7 @@ def getAssessmentByID(user_id, db, metadata, assmt_id):
             ]))
 
     # Build syllabus — document mode: already in query 1 (no extra roundtrip)
-    if topic_source == 'document':
+    if source_kind == 'document':
         syllabus = OrderedDict([
             ('name',        first['doc_name']),
             ('size_bytes',  first['doc_size_bytes']),
@@ -1465,7 +1509,7 @@ def getAssessmentByID(user_id, db, metadata, assmt_id):
             ('url',         first['doc_url']),
         ]) if first['doc_name'] else None
 
-    elif topic_source == 'topic':
+    elif source_kind == 'topic':
         # topic mode — Query 2: join ca_has_topics → subject_topic_mappings directly.
         # No user/subject chain needed: topics were validated at creation time.
         topic_rows = db.execute(
@@ -1512,7 +1556,7 @@ def getAssessmentByID(user_id, db, metadata, assmt_id):
         ('assmt_id',         first['assmt_id']),
         ('title',            first['assmt_title']),
         ('description',      first['assmt_brief']),
-        ('source_kind',      topic_source),
+        ('source_kind',      source_kind),
         ('subject_code',     first['subject_code']),
         ('question_count',   first['question_count']),
         ('duration_minutes', first['duration_minutes']),
@@ -1583,7 +1627,7 @@ def getAssessmentStats(user_id, db, metadata, assmt_id, sort=None):
         select(
             curiosity_assessment.c.assmt_id,
             curiosity_assessment.c.assmt_title,
-            curiosity_assessment.c.topic_source,
+            curiosity_assessment.c.source_kind,
             curiosity_assessment.c.subject_code,
             curiosity_assessment.c.doc_name,
             curiosity_assessment.c.doc_storage_url,
@@ -1627,7 +1671,7 @@ def getAssessmentStats(user_id, db, metadata, assmt_id, sort=None):
     # Assessment fields are identical across all rows — read from first
     first        = rows[0]
     view_status  = first['status']
-    topic_source = first['topic_source']
+    source_kind = first['source_kind']
     avg_score    = round(float(first['avg_composite_score']), 2) if first['avg_composite_score'] else None
 
     # Single pass over rows — counts, top_score, and student list together
@@ -1705,8 +1749,8 @@ def getAssessmentStats(user_id, db, metadata, assmt_id, sort=None):
     ).mappings().all()
     sections = [r['section_name'] for r in section_rows]
 
-    # Syllabus block — shape depends on topic_source
-    if topic_source == 'document':
+    # Syllabus block — shape depends on source_kind
+    if source_kind == 'document':
         syllabus = OrderedDict([
             ('source_kind', 'document'),
             ('name',        first['doc_name']),
@@ -2017,7 +2061,7 @@ def getAssessmentSyllabus(user_id, db, metadata, assmt_id):
     assmt = db.execute(
         select(
             curiosity_assessment.c.assmt_id,
-            curiosity_assessment.c.topic_source,
+            curiosity_assessment.c.source_kind,
             curiosity_assessment.c.created_by
         )
         .where(curiosity_assessment.c.assmt_id == assmt_id)
@@ -2026,7 +2070,7 @@ def getAssessmentSyllabus(user_id, db, metadata, assmt_id):
     if not assmt or not _checkAccess(user_id, assmt_id, db, metadata, created_by=assmt['created_by']):
         return None
 
-    if assmt['topic_source'] == 'document':
+    if assmt['source_kind'] == 'document':
         doc_row = db.execute(
             select(
                 curiosity_assessment.c.doc_name,

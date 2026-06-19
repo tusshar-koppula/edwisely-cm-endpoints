@@ -124,7 +124,7 @@ CREATE TABLE student_section_mapping (
 CREATE TABLE curiosity_assessment (
     assmt_id               INT          NOT NULL AUTO_INCREMENT,
     created_by             INT          NOT NULL,
-    topic_source           ENUM('document','topic') NOT NULL,
+    source_kind           ENUM('document','topic') NOT NULL,
     assmt_title            VARCHAR(255) NOT NULL,
     assmt_brief            TEXT         DEFAULT NULL,
     question_count         TINYINT      NOT NULL DEFAULT 3,
@@ -133,6 +133,7 @@ CREATE TABLE curiosity_assessment (
     doc_name               VARCHAR(255) DEFAULT NULL,
     doc_s3_key             VARCHAR(512) DEFAULT NULL,
     doc_storage_url        TEXT         DEFAULT NULL,
+    vector_store_id        VARCHAR(100) DEFAULT NULL,
     doc_pages              SMALLINT     DEFAULT NULL,
     doc_size_bytes         INT          DEFAULT NULL,
     rubric_relevance_limit TINYINT      NOT NULL DEFAULT 4,
@@ -144,8 +145,8 @@ CREATE TABLE curiosity_assessment (
     is_deleted             TINYINT(1)   NOT NULL DEFAULT 0,
     avg_composite_score    DECIMAL(4,2) DEFAULT NULL,
     avg_r_score            DECIMAL(4,2) DEFAULT NULL,
-    avg_b_score            DECIMAL(4,2) DEFAULT NULL,
-    avg_d_score            DECIMAL(4,2) DEFAULT NULL,
+    avg_b_score            DECIMAL(3,2) DEFAULT NULL,
+    avg_d_score            DECIMAL(3,2) DEFAULT NULL,
     median_time_seconds    INT          DEFAULT NULL,
     score_distribution     JSON         DEFAULT NULL,
     created_at             DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -170,8 +171,8 @@ CREATE TABLE ca_has_students (
     started_at           DATETIME    DEFAULT NULL,
     avg_composite_score DECIMAL(4,2) DEFAULT NULL,
     avg_r_score         DECIMAL(4,2) DEFAULT NULL,
-    avg_b_score         DECIMAL(4,2) DEFAULT NULL,
-    avg_d_score         DECIMAL(4,2) DEFAULT NULL,
+    avg_b_score         DECIMAL(3,2) DEFAULT NULL,
+    avg_d_score         DECIMAL(3,2) DEFAULT NULL,
     added_at            DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (ca_id, student_id),
     CONSTRAINT fk_students_assmt FOREIGN KEY (ca_id)
@@ -184,12 +185,15 @@ CREATE TABLE ca_question_submissions (
     student_id      INT          NOT NULL,
     question_number TINYINT      NOT NULL DEFAULT 1,
     question        TEXT         NOT NULL,
-    r_score         DECIMAL(4,2) DEFAULT NULL,
-    b_score         DECIMAL(4,2) DEFAULT NULL,
-    d_score         DECIMAL(4,2) DEFAULT NULL,
-    composite_score DECIMAL(4,2) DEFAULT NULL,
-    ai_feedback     TEXT         DEFAULT NULL,
-    submitted_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    r_score          DECIMAL(4,2) DEFAULT NULL,
+    b_score          DECIMAL(3,2) DEFAULT NULL,
+    d_score          DECIMAL(3,2) DEFAULT NULL,
+    composite_score  DECIMAL(4,2) DEFAULT NULL,
+    verdict          VARCHAR(500)  DEFAULT NULL,
+    ai_feedback      TEXT          DEFAULT NULL,
+    question_reframe TEXT          DEFAULT NULL,
+    nudge            TEXT          DEFAULT NULL,
+    submitted_at     DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (q_id),
     CONSTRAINT fk_questions_assmt FOREIGN KEY (ca_id)
         REFERENCES curiosity_assessment(assmt_id) ON DELETE CASCADE
@@ -307,7 +311,7 @@ INSERT INTO student_section_mapping (id, student_id, section_id) VALUES
 
 -- ── Assessment 1: DRAFT ───────────────────────────────────────
 INSERT INTO curiosity_assessment
-    (assmt_id, created_by, topic_source, assmt_title, assmt_brief, question_count, duration_minutes,
+    (assmt_id, created_by, source_kind, assmt_title, assmt_brief, question_count, duration_minutes,
      subject_code, rubric_relevance_limit, rubric_blooms_limit, rubric_depth_limit,
      status, start_time, end_time, is_deleted, created_at, updated_at)
 VALUES
@@ -319,9 +323,10 @@ INSERT INTO ca_has_sections (ca_id, section_id) VALUES (1, 1), (1, 2);
 INSERT INTO ca_has_topics   (ca_id, topic_id)   VALUES (1, 1), (1, 2);
 
 -- ── Assessment 2: LIVE ────────────────────────────────────────
--- avg scores reflect Alice's 3 submitted questions (Bob is still writing)
+-- avg scores reflect Alice's 3 submitted questions only (Bob is still writing)
+-- composite/r: 0-10  |  b: 0-6 (Bloom level)  |  d: 0-4
 INSERT INTO curiosity_assessment
-    (assmt_id, created_by, topic_source, assmt_title, assmt_brief, question_count, duration_minutes,
+    (assmt_id, created_by, source_kind, assmt_title, assmt_brief, question_count, duration_minutes,
      subject_code, rubric_relevance_limit, rubric_blooms_limit, rubric_depth_limit,
      status, start_time, end_time, is_deleted,
      avg_composite_score, avg_r_score, avg_b_score, avg_d_score,
@@ -329,30 +334,36 @@ INSERT INTO curiosity_assessment
 VALUES
 (2, 101, 'topic', 'DSA Quiz - Trees and Graphs', 'Binary trees and graph traversal.',
  3, 20, 'CS201', 4, 3, 3, 'live',
- '2026-06-12 08:00:00', '2026-06-12 23:59:00', 0,
- 7.83, 8.33, 7.83, 7.33,
+ '2026-06-12 08:00:00', '2026-12-31 23:59:00', 0,
+ 6.83, 8.33, 3.00, 2.33,
  '2026-06-11 18:00:00', '2026-06-12 08:00:00');
 
 INSERT INTO ca_has_sections (ca_id, section_id) VALUES (2, 1);
 INSERT INTO ca_has_topics   (ca_id, topic_id)   VALUES (2, 3), (2, 4);
 
--- avg scores for Alice: avg of her 3 question composite/dim scores
+-- Alice: avg of her 3 submitted questions  |  student 203: not_started (tests timer-init path)
+-- Bob: writing with 2 questions already asked (tests previous-question-cards path)
 INSERT INTO ca_has_students
     (ca_id, student_id, status, submitted_at, time_elapsed_seconds, started_at,
      avg_composite_score, avg_r_score, avg_b_score, avg_d_score) VALUES
-(2, 201, 'submitted', '2026-06-12 09:30:00', 820,  '2026-06-12 09:16:20', 7.83, 8.33, 7.83, 7.33),
-(2, 202, 'writing',   NULL,                  NULL, '2026-06-12 09:20:00', NULL, NULL, NULL, NULL);
+(2, 201, 'submitted', '2026-06-12 09:30:00', 820,  '2026-06-12 09:16:20', 6.83, 8.33, 3.00, 2.33),
+(2, 202, 'writing',   NULL,                  NULL, '2026-06-12 09:20:00', NULL, NULL, NULL, NULL),
+(2, 203, 'not_started', NULL,                NULL, NULL,                  NULL, NULL, NULL, NULL);
 
-INSERT INTO ca_question_submissions (q_id, ca_id, student_id, question_number, question, r_score, b_score, d_score, composite_score, ai_feedback, submitted_at) VALUES
-(1, 2, 201, 1, 'How does in-order traversal work in a binary tree?',  8.5, 7.0, 7.5, 7.67, 'Good understanding. Mention edge cases.',           '2026-06-12 09:15:00'),
-(2, 2, 201, 2, 'What is the time complexity of BFS on a graph?',      9.0, 8.5, 8.0, 8.50, 'Excellent. Also discuss space complexity.',         '2026-06-12 09:22:00'),
-(3, 2, 201, 3, 'Explain DFS with an example.',                         7.5, 8.0, 6.5, 7.33, 'Correct example. Deeper use-case analysis needed.', '2026-06-12 09:30:00');
+-- Alice's submitted questions (ca_id=2) + Bob's in-progress questions
+INSERT INTO ca_question_submissions (q_id, ca_id, student_id, question_number, question, r_score, b_score, d_score, composite_score, verdict, ai_feedback, submitted_at) VALUES
+(1,  2, 201, 1, 'How does in-order traversal work in a binary tree?',  8.5, 2.0, 2.0, 6.50, 'Clean traversal probe.',      'Good understanding. Mention edge cases.',            '2026-06-12 09:15:00'),
+(2,  2, 201, 2, 'What is the time complexity of BFS on a graph?',      9.0, 4.0, 3.0, 8.00, 'Precise complexity query.',   'Excellent. Also discuss space complexity.',          '2026-06-12 09:22:00'),
+(3,  2, 201, 3, 'Explain DFS with an example.',                        7.5, 3.0, 2.0, 6.00, 'Good but broad — narrow it.', 'Correct example. Deeper use-case analysis needed.',  '2026-06-12 09:30:00'),
+-- Bob — writing, 2 questions already asked (not submitted, so not counted in class avg)
+(13, 2, 202, 1, 'Why does BFS use a queue and not a stack?',           8.0, 4.0, 3.0, 7.50, 'Sharp mechanism question.',   NULL,                                                 '2026-06-12 09:25:00'),
+(14, 2, 202, 2, 'How do you detect a cycle in a directed graph?',      8.5, 3.0, 3.0, 7.00, 'Strong application probe.',   NULL,                                                 '2026-06-12 09:28:00');
 
 -- ── Assessment 3: ENDED ───────────────────────────────────────
 -- median of submitted elapsed times [2700, 4200, 5400] = 4200s
 -- class avg across 3 submitted students (David is absent)
 INSERT INTO curiosity_assessment
-    (assmt_id, created_by, topic_source, assmt_title, assmt_brief, question_count, duration_minutes,
+    (assmt_id, created_by, source_kind, assmt_title, assmt_brief, question_count, duration_minutes,
      doc_name, doc_s3_key, doc_storage_url, doc_pages, doc_size_bytes,
      rubric_relevance_limit, rubric_blooms_limit, rubric_depth_limit,
      status, start_time, end_time, is_deleted,
@@ -366,8 +377,8 @@ VALUES
  12, 204800,
  4, 3, 3, 'ended',
  '2026-06-05 09:00:00', '2026-06-05 11:00:00', 0,
- 8.00, 8.28, 8.11, 7.61, 4200,
- '[{"band":"5-6","count":0},{"band":"6-7","count":0},{"band":"7-8","count":1},{"band":"8-9","count":2},{"band":"9-10","count":0}]',
+ 6.83, 8.28, 3.22, 2.56, 4200,
+ '[{"band":"5-6","count":1},{"band":"6-7","count":0},{"band":"7-8","count":1},{"band":"8-9","count":1},{"band":"9-10","count":0}]',
  '2026-06-04 12:00:00', '2026-06-05 11:05:00');
 
 INSERT INTO ca_has_sections (ca_id, section_id) VALUES (3, 1), (3, 2);
@@ -375,24 +386,25 @@ INSERT INTO ca_has_sections (ca_id, section_id) VALUES (3, 1), (3, 2);
 INSERT INTO ca_has_students
     (ca_id, student_id, status, submitted_at, time_elapsed_seconds, started_at,
      avg_composite_score, avg_r_score, avg_b_score, avg_d_score) VALUES
-(3, 201, 'submitted', '2026-06-05 09:45:00', 2700, '2026-06-05 09:00:00', 8.22, 8.50, 8.33, 7.83),
-(3, 202, 'submitted', '2026-06-05 10:10:00', 4200, '2026-06-05 09:00:00', 7.11, 7.33, 7.33, 6.67),
-(3, 203, 'submitted', '2026-06-05 10:30:00', 5400, '2026-06-05 09:00:00', 8.67, 9.00, 8.67, 8.33),
+(3, 201, 'submitted', '2026-06-05 09:45:00', 2700, '2026-06-05 09:00:00', 7.00, 8.50, 3.00, 2.67),
+(3, 202, 'submitted', '2026-06-05 10:10:00', 4200, '2026-06-05 09:00:00', 5.50, 7.33, 2.67, 1.67),
+(3, 203, 'submitted', '2026-06-05 10:30:00', 5400, '2026-06-05 09:00:00', 8.00, 9.00, 4.00, 3.33),
 (3, 204, 'not_started', NULL,                NULL, NULL,                  NULL, NULL, NULL, NULL);
 
-INSERT INTO ca_question_submissions (q_id, ca_id, student_id, question_number, question, r_score, b_score, d_score, composite_score, ai_feedback, submitted_at) VALUES
--- Alice (avg composite=8.22, r=8.50, b=8.33, d=7.83)
-(4,  3, 201, 1, 'What is the difference between a stack and a queue?',      8.0, 8.5, 7.0, 7.83, 'Clear explanation. Add real-world examples.',  '2026-06-05 09:20:00'),
-(5,  3, 201, 2, 'How does dynamic memory allocation work in linked lists?', 9.0, 7.5, 8.5, 8.33, 'Strong. Mention memory leaks.',                '2026-06-05 09:35:00'),
-(6,  3, 201, 3, 'Explain the concept of a hash table.',                     8.5, 9.0, 8.0, 8.50, 'Excellent. Cover collision handling.',         '2026-06-05 09:45:00'),
--- Bob (avg composite=7.11, r=7.33, b=7.33, d=6.67)
-(7,  3, 202, 1, 'What is a stack and how is it used in recursion?',         7.5, 8.0, 6.5, 7.33, 'Good basics. Elaborate on call stack.',        '2026-06-05 09:50:00'),
-(8,  3, 202, 2, 'Compare arrays and linked lists for memory usage.',        8.0, 7.0, 7.5, 7.50, 'Correct. Mention cache performance.',          '2026-06-05 10:00:00'),
-(9,  3, 202, 3, 'What is a priority queue?',                                6.5, 7.0, 6.0, 6.50, 'Basic. Discuss heap implementations.',         '2026-06-05 10:10:00'),
--- Carol (avg composite=8.67, r=9.00, b=8.67, d=8.33)
-(10, 3, 203, 1, 'Describe a real-world use of a queue.',                    9.0, 8.0, 8.5, 8.50, 'Very good real-world example.',                '2026-06-05 10:10:00'),
-(11, 3, 203, 2, 'How is a BST different from a sorted array?',              8.5, 9.0, 7.5, 8.33, 'Good comparison. Add complexity analysis.',    '2026-06-05 10:20:00'),
-(12, 3, 203, 3, 'What is memoization and when is it useful?',               9.5, 9.0, 9.0, 9.17, 'Outstanding!',                                 '2026-06-05 10:30:00');
+-- composite/r: 0-10  |  b: 0-6 (Bloom level)  |  d: 0-4
+INSERT INTO ca_question_submissions (q_id, ca_id, student_id, question_number, question, r_score, b_score, d_score, composite_score, verdict, ai_feedback, submitted_at) VALUES
+-- Alice (avg composite=7.00, r=8.50, b=3.00, d=2.67)
+(4,  3, 201, 1, 'What is the difference between a stack and a queue?',      8.0, 4.0, 2.5, 7.00, 'Clear contrast question.',        'Clear explanation. Add real-world examples.',  '2026-06-05 09:20:00'),
+(5,  3, 201, 2, 'How does dynamic memory allocation work in linked lists?', 9.0, 3.0, 3.0, 7.50, 'Deep mechanism probe.',           'Strong. Mention memory leaks.',                '2026-06-05 09:35:00'),
+(6,  3, 201, 3, 'Explain the concept of a hash table.',                     8.5, 2.0, 2.5, 6.50, 'Solid conceptual ask.',           'Excellent. Cover collision handling.',         '2026-06-05 09:45:00'),
+-- Bob (avg composite=5.50, r=7.33, b=2.67, d=1.67)
+(7,  3, 202, 1, 'What is a stack and how is it used in recursion?',         7.5, 3.0, 2.0, 6.00, 'Good applied framing.',           'Good basics. Elaborate on call stack.',        '2026-06-05 09:50:00'),
+(8,  3, 202, 2, 'Compare arrays and linked lists for memory usage.',        8.0, 4.0, 2.0, 6.50, 'Useful comparative ask.',         'Correct. Mention cache performance.',          '2026-06-05 10:00:00'),
+(9,  3, 202, 3, 'What is a priority queue?',                                6.5, 1.0, 1.0, 4.00, 'Definitional — push deeper.',     'Basic. Discuss heap implementations.',         '2026-06-05 10:10:00'),
+-- Carol (avg composite=8.00, r=9.00, b=4.00, d=3.33)
+(10, 3, 203, 1, 'Describe a real-world use of a queue.',                    9.0, 3.0, 3.0, 7.50, 'Strong practical framing.',       'Very good real-world example.',                '2026-06-05 10:10:00'),
+(11, 3, 203, 2, 'How is a BST different from a sorted array?',              8.5, 4.0, 3.0, 7.50, 'Sharp structural compare.',       'Good comparison. Add complexity analysis.',    '2026-06-05 10:20:00'),
+(12, 3, 203, 3, 'What is memoization and when is it useful?',               9.5, 5.0, 4.0, 9.00, 'Excellent — applied and precise.','Outstanding!',                                 '2026-06-05 10:30:00');
 
 INSERT INTO ca_faculty_feedback (feedback_id, ca_id, student_id, sent_by, message, sent_at) VALUES
 (1, 3, 201, 101, 'Great attempt Alice! Focus more on time complexity.',         '2026-06-05 12:00:00'),
@@ -404,7 +416,7 @@ INSERT INTO ca_share (ca_id, scope, share_url, notified_emails, created_by, crea
 
 -- ── Assessment 4: SCHEDULED ───────────────────────────────────
 INSERT INTO curiosity_assessment
-    (assmt_id, created_by, topic_source, assmt_title, assmt_brief, question_count, duration_minutes,
+    (assmt_id, created_by, source_kind, assmt_title, assmt_brief, question_count, duration_minutes,
      subject_code, rubric_relevance_limit, rubric_blooms_limit, rubric_depth_limit,
      status, start_time, end_time, is_deleted, created_at, updated_at)
 VALUES
@@ -436,7 +448,7 @@ INSERT INTO ca_similar_questions (source_q_id, question) VALUES
 
 -- ── Assessment 5: SOFT-DELETED ────────────────────────────────
 INSERT INTO curiosity_assessment
-    (assmt_id, created_by, topic_source, assmt_title, assmt_brief, question_count, duration_minutes,
+    (assmt_id, created_by, source_kind, assmt_title, assmt_brief, question_count, duration_minutes,
      subject_code, rubric_relevance_limit, rubric_blooms_limit, rubric_depth_limit,
      status, start_time, end_time, is_deleted, created_at, updated_at)
 VALUES
@@ -444,27 +456,3 @@ VALUES
  3, 15, 'CS201', 4, 3, 3, 'draft', NULL, NULL, 1,
  '2026-06-01 10:00:00', '2026-06-01 10:00:00');
 
-
--- -------------------------------------------------------
--- PART D: Patches for getAssessmentStats() testing
--- -------------------------------------------------------
-
--- Fix end_time on the LIVE assessment so closes_in is meaningful
-UPDATE curiosity_assessment
-SET end_time = '2026-12-31 23:59:00'
-WHERE assmt_id = 2;
-
--- Add started_at for LIVE assessment students (assmt_id = 2)
--- Alice: submitted 09:30, elapsed 820s → started_at = 09:30 - 820s = 09:16:20
--- Bob:   still writing, started at 09:20:00
-UPDATE ca_has_students SET started_at = '2026-06-12 09:16:20' WHERE ca_id = 2 AND student_id = 201;
-UPDATE ca_has_students SET started_at = '2026-06-12 09:20:00' WHERE ca_id = 2 AND student_id = 202;
-
--- Add started_at for ENDED assessment students (assmt_id = 3)
--- Alice: submitted 09:45, elapsed 2700s (45m) → started_at = 09:00:00
--- Bob:   submitted 10:10, elapsed 4200s (70m) → started_at = 09:00:00
--- Carol: submitted 10:30, elapsed 5400s (90m) → started_at = 09:00:00
--- David: not_started → stays NULL
-UPDATE ca_has_students SET started_at = '2026-06-05 09:00:00' WHERE ca_id = 3 AND student_id = 201;
-UPDATE ca_has_students SET started_at = '2026-06-05 09:00:00' WHERE ca_id = 3 AND student_id = 202;
-UPDATE ca_has_students SET started_at = '2026-06-05 09:00:00' WHERE ca_id = 3 AND student_id = 203;
