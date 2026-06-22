@@ -3,13 +3,21 @@ from sqlalchemy import select, and_, or_, func, distinct, case, text, update
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 import os
+import time
 import uuid
 import io
 import threading
 import boto3
 from pypdf import PdfReader
 from openai import OpenAI
+from redis_client import redis_client
+
+log = logging.getLogger(__name__)
+
+_VS_READY_TTL  = 86400   # 24 h — matches practical vector store lifetime
+_VS_FAILED_TTL = 3600    # 1 h  — allow retry after transient failure
 
 _s3 = boto3.client(
     's3',
@@ -147,6 +155,60 @@ def _checkAccess(user_id, assmt_id, db, metadata, created_by=None):
         return match is not None
 
     return False
+
+
+# ------------------------------------------------------------
+# HELPER — expand a recipients list into (section_ids, individual_student_ids)
+#
+# Four recipient kinds are supported:
+#   section    → used directly
+#   department → expanded to active sections via college_department_section_new
+#   semester   → expanded to active sections via subject-section mapping
+#   student    → returned as individual_ids (inserted straight into ca_has_students)
+#
+# section_ids includes all sections from direct selection, departments, and
+# semesters — stored in ca_has_sections so future updates without re-specifying
+# recipients can still re-expand to students correctly.
+# ------------------------------------------------------------
+def _expand_recipients(recipients, db, metadata):
+    section_ids    = list({r['id'] for r in recipients if r.get('kind') == 'section'})
+    department_ids = list({r['id'] for r in recipients if r.get('kind') == 'department'})
+    semester_ids   = list({r['id'] for r in recipients if r.get('kind') == 'semester'})
+    individual_ids = list({r['id'] for r in recipients if r.get('kind') == 'student'})
+
+    college_department_section_new                         = metadata.tables['college_department_section_new']
+    college_account_subject_college_department_section_new = metadata.tables['college_account_subject_college_department_section_new']
+    college_subject_mapping                                = metadata.tables['college_subject_mapping']
+
+    if department_ids:
+        rows = db.execute(
+            select(college_department_section_new.c.id)
+            .where(and_(
+                college_department_section_new.c.department_id.in_(department_ids),
+                college_department_section_new.c.active == 1,
+                college_department_section_new.c.test   == 0,
+            ))
+        ).mappings().all()
+        section_ids = list({*section_ids, *(r['id'] for r in rows)})
+
+    if semester_ids:
+        rows = db.execute(
+            select(college_account_subject_college_department_section_new.c.college_department_section_id)
+            .join(college_subject_mapping,
+                college_subject_mapping.c.id == college_account_subject_college_department_section_new.c.college_subject_mapping_id)
+            .join(college_department_section_new,
+                college_department_section_new.c.id == college_account_subject_college_department_section_new.c.college_department_section_id)
+            .where(and_(
+                college_subject_mapping.c.semester_id.in_(semester_ids),
+                college_account_subject_college_department_section_new.c.inactive == 0,
+                college_department_section_new.c.active == 1,
+                college_department_section_new.c.test   == 0,
+            ))
+            .distinct()
+        ).mappings().all()
+        section_ids = list({*section_ids, *(r['college_department_section_id'] for r in rows)})
+
+    return section_ids, individual_ids
 
 
 # ============================================================
@@ -963,17 +1025,32 @@ def getStudents(user_id, db, metadata, role, section_id=None, q=None):
 
 
 def _ingest_to_vector_store(vector_store_id, file_bytes, filename):
+    t0 = time.perf_counter()
     try:
-        file_obj = _openai.files.create(
-            file=(filename, io.BytesIO(file_bytes), 'application/pdf'),
-            purpose='assistants'
-        )
-        _openai.vector_stores.files.create(
+        # upload_and_poll uploads the file, attaches it to the vector store, and
+        # blocks until OpenAI signals status='completed' or 'failed' — no manual
+        # polling loop needed; the SDK handles the retry/backoff internally.
+        batch = _openai.vector_stores.file_batches.upload_and_poll(
             vector_store_id=vector_store_id,
-            file_id=file_obj.id
+            files=[(filename, io.BytesIO(file_bytes), 'application/pdf')],
         )
-    except Exception:
-        pass
+        elapsed = time.perf_counter() - t0
+        if batch.status == 'completed':
+            log.info(
+                "TIMING | vector_store_indexing=%.3fs status=completed file_counts=%s",
+                elapsed, batch.file_counts,
+            )
+            redis_client.set("ca_vs_ready:{}".format(vector_store_id), "1", ex=_VS_READY_TTL)
+        else:
+            log.error(
+                "TIMING | vector_store_indexing=%.3fs status=%s file_counts=%s",
+                elapsed, batch.status, batch.file_counts,
+            )
+            redis_client.set("ca_vs_ready:{}".format(vector_store_id), "failed", ex=_VS_FAILED_TTL)
+    except Exception as e:
+        elapsed = time.perf_counter() - t0
+        log.error("TIMING | vector_store_indexing=%.3fs EXCEPTION: %s", elapsed, e)
+        redis_client.set("ca_vs_ready:{}".format(vector_store_id), "failed", ex=_VS_FAILED_TTL)
 
 
 def uploadDocument(user_id, db, metadata, file):
@@ -1023,11 +1100,10 @@ def createAssessment(user_id, db, metadata,
                      subject_code, recipients, question_count, duration_minutes,
                      start_time, end_time, rubric, status):
 
-    curiosity_assessment = metadata.tables['curiosity_assessment']
-    ca_has_sections      = metadata.tables['ca_has_sections']
-    ca_has_topics        = metadata.tables['ca_has_topics']
-    ca_has_students      = metadata.tables['ca_has_students']
-    # student_section_mapping used to expand section → students
+    curiosity_assessment    = metadata.tables['curiosity_assessment']
+    ca_has_sections         = metadata.tables['ca_has_sections']
+    ca_has_topics           = metadata.tables['ca_has_topics']
+    ca_has_students         = metadata.tables['ca_has_students']
     student_section_mapping = metadata.tables['student_section_mapping']
 
     # Parse ISO strings to datetime if provided
@@ -1068,10 +1144,9 @@ def createAssessment(user_id, db, metadata,
         )
         assmt_id = result.lastrowid
 
-        # Collect unique section_ids from recipients
-        section_ids = list({r['id'] for r in recipients if r.get('kind') == 'section'}) if recipients else []
+        section_ids, individual_ids = _expand_recipients(recipients, db, metadata) if recipients else ([], [])
 
-        # Insert section rows
+        # Persist all sections (direct + department-expanded + semester-expanded) for future re-expansion
         if section_ids:
             db.execute(
                 ca_has_sections.insert(),
@@ -1085,25 +1160,28 @@ def createAssessment(user_id, db, metadata,
                 [{'ca_id': assmt_id, 'topic_id': tid} for tid in topic_ids]
             )
 
-        # If launching live now, expand sections into individual student rows
-        if status == 'live' and section_ids:
-            student_rows = db.execute(
-                select(student_section_mapping.c.student_id)
-                .where(student_section_mapping.c.section_id.in_(section_ids))
-            ).mappings().all()
+        # Always persist individual recipients so draft→live transition without re-passing recipients works
+        if individual_ids:
+            db.execute(
+                ca_has_students.insert(),
+                [{'ca_id': assmt_id, 'student_id': sid, 'status': 'not_started', 'added_at': now}
+                 for sid in individual_ids]
+            )
 
-            if student_rows:
+        # If launching live: expand sections → students and insert any not already enrolled
+        if status == 'live' and section_ids:
+            section_students = {
+                r['student_id'] for r in db.execute(
+                    select(student_section_mapping.c.student_id)
+                    .where(student_section_mapping.c.section_id.in_(section_ids))
+                ).mappings().all()
+            }
+            new_from_sections = section_students - set(individual_ids)
+            if new_from_sections:
                 db.execute(
                     ca_has_students.insert(),
-                    [
-                        {
-                            'ca_id':      assmt_id,
-                            'student_id': r['student_id'],
-                            'status':     'not_started',
-                            'added_at':   now
-                        }
-                        for r in student_rows
-                    ]
+                    [{'ca_id': assmt_id, 'student_id': sid, 'status': 'not_started', 'added_at': now}
+                     for sid in new_from_sections]
                 )
 
         db.commit()
@@ -1254,75 +1332,84 @@ def updateAssessment(user_id, db, metadata, assmt_id,
             .values(**values)
         )
 
-        # Re-sync sections if recipients changed
+        # Re-sync sections and enroll students if recipients changed
         if recipients is not None:
-            new_section_ids = list({r['id'] for r in recipients if r.get('kind') == 'section'})
-            db.execute(
-                ca_has_sections.delete()
-                .where(ca_has_sections.c.ca_id == assmt_id)
-            )
+            new_section_ids, new_individual_ids = _expand_recipients(recipients, db, metadata)
+
+            db.execute(ca_has_sections.delete().where(ca_has_sections.c.ca_id == assmt_id))
             if new_section_ids:
                 db.execute(
                     ca_has_sections.insert(),
                     [{'ca_id': assmt_id, 'section_id': sid} for sid in new_section_ids]
                 )
 
-            # If going live, expand students from updated sections
-            if status == 'live' and new_section_ids:
-                candidate_rows = db.execute(
-                    select(student_section_mapping.c.student_id)
-                    .where(student_section_mapping.c.section_id.in_(new_section_ids))
-                ).mappings().all()
-                if candidate_rows:
-                    already_enrolled = {r['student_id'] for r in db.execute(
-                        select(ca_has_students.c.student_id)
-                        .where(ca_has_students.c.ca_id == assmt_id)
-                    ).mappings().all()}
-                    new_students = [r for r in candidate_rows if r['student_id'] not in already_enrolled]
-                    if new_students:
-                        db.execute(
-                            ca_has_students.insert(),
-                            [
-                                {
-                                    'ca_id':      assmt_id,
-                                    'student_id': r['student_id'],
-                                    'status':     'not_started',
-                                    'added_at':   _utcnow()
-                                }
-                                for r in new_students
-                            ]
-                        )
+            # Always sync individual students (draft or live) so draft→live transition works without re-passing recipients.
+            # Mirror ca_has_sections: remove students no longer in individual_ids, add new ones.
+            # Only touch rows with status='not_started' to avoid removing students who already started.
+            existing_individual = {r['student_id'] for r in db.execute(
+                select(ca_has_students.c.student_id)
+                .where(ca_has_students.c.ca_id == assmt_id)
+            ).mappings().all()}
+            to_remove = existing_individual - set(new_individual_ids)
+            if to_remove:
+                db.execute(
+                    ca_has_students.delete()
+                    .where(and_(
+                        ca_has_students.c.ca_id == assmt_id,
+                        ca_has_students.c.student_id.in_(to_remove),
+                        ca_has_students.c.status == 'not_started',
+                    ))
+                )
+            to_add_individual = set(new_individual_ids) - existing_individual
+            if to_add_individual:
+                db.execute(
+                    ca_has_students.insert(),
+                    [{'ca_id': assmt_id, 'student_id': sid, 'status': 'not_started', 'added_at': _utcnow()}
+                     for sid in to_add_individual]
+                )
 
-        # If going live without changing recipients, expand students from existing sections
+            if status == 'live' and new_section_ids:
+                section_students = {
+                    r['student_id'] for r in db.execute(
+                        select(student_section_mapping.c.student_id)
+                        .where(student_section_mapping.c.section_id.in_(new_section_ids))
+                    ).mappings().all()
+                }
+                already = {r['student_id'] for r in db.execute(
+                    select(ca_has_students.c.student_id)
+                    .where(ca_has_students.c.ca_id == assmt_id)
+                ).mappings().all()}
+                new_from_sections = section_students - already
+                if new_from_sections:
+                    db.execute(
+                        ca_has_students.insert(),
+                        [{'ca_id': assmt_id, 'student_id': sid, 'status': 'not_started', 'added_at': _utcnow()}
+                         for sid in new_from_sections]
+                    )
+
+        # If going live without changing recipients, re-expand from existing sections
+        # (departments/semesters were already flattened to section_ids in ca_has_sections)
         elif status == 'live':
-            existing_sections = db.execute(
+            existing_section_ids = [r['section_id'] for r in db.execute(
                 select(ca_has_sections.c.section_id)
                 .where(ca_has_sections.c.ca_id == assmt_id)
-            ).mappings().all()
-            existing_section_ids = [r['section_id'] for r in existing_sections]
+            ).mappings().all()]
             if existing_section_ids:
-                candidate_rows = db.execute(
+                enrolled = {r['student_id'] for r in db.execute(
                     select(student_section_mapping.c.student_id)
                     .where(student_section_mapping.c.section_id.in_(existing_section_ids))
-                ).mappings().all()
-                if candidate_rows:
-                    already_enrolled = {r['student_id'] for r in db.execute(
+                ).mappings().all()}
+                if enrolled:
+                    already = {r['student_id'] for r in db.execute(
                         select(ca_has_students.c.student_id)
                         .where(ca_has_students.c.ca_id == assmt_id)
                     ).mappings().all()}
-                    new_students = [r for r in candidate_rows if r['student_id'] not in already_enrolled]
+                    new_students = enrolled - already
                     if new_students:
                         db.execute(
                             ca_has_students.insert(),
-                            [
-                                {
-                                    'ca_id':      assmt_id,
-                                    'student_id': r['student_id'],
-                                    'status':     'not_started',
-                                    'added_at':   _utcnow()
-                                }
-                                for r in new_students
-                            ]
+                            [{'ca_id': assmt_id, 'student_id': sid, 'status': 'not_started', 'added_at': _utcnow()}
+                             for sid in new_students]
                         )
 
         # Re-sync topics if changed, or purge if switching to document mode
@@ -1883,6 +1970,7 @@ def getStudentQuestions(user_id, db, metadata, assmt_id, student_id):
     curiosity_assessment    = metadata.tables['curiosity_assessment']
     ca_question_submissions = metadata.tables['ca_question_submissions']
     ca_faculty_feedback     = metadata.tables['ca_faculty_feedback']
+    ca_has_students         = metadata.tables['ca_has_students']
 
     assmt = db.execute(
         select(curiosity_assessment.c.assmt_id, curiosity_assessment.c.created_by)
@@ -1903,6 +1991,7 @@ def getStudentQuestions(user_id, db, metadata, assmt_id, student_id):
             ca_question_submissions.c.d_score,
             ca_question_submissions.c.composite_score,
             ca_question_submissions.c.ai_feedback,
+            ca_question_submissions.c.question_reframe,
             ca_question_submissions.c.submitted_at
         )
         .where(
@@ -1913,6 +2002,22 @@ def getStudentQuestions(user_id, db, metadata, assmt_id, student_id):
         )
         .order_by(ca_question_submissions.c.question_number)
     ).mappings().all()
+
+    # Fetch student's aggregate scores for this assessment
+    student_row = db.execute(
+        select(
+            ca_has_students.c.avg_composite_score,
+            ca_has_students.c.avg_r_score,
+            ca_has_students.c.avg_b_score,
+            ca_has_students.c.avg_d_score,
+        )
+        .where(
+            and_(
+                ca_has_students.c.ca_id == assmt_id,
+                ca_has_students.c.student_id == student_id
+            )
+        )
+    ).mappings().first()
 
     # Fetch any faculty feedback for this student in this assessment
     feedback_rows = db.execute(
@@ -1933,15 +2038,16 @@ def getStudentQuestions(user_id, db, metadata, assmt_id, student_id):
     questions = []
     for row in q_rows:
         questions.append(OrderedDict([
-            ('q_id',            row['q_id']),
-            ('question_number', row['question_number']),
-            ('question_text',   row['question']),
-            ('r_score',         float(row['r_score'])         if row['r_score']         else None),
-            ('b_score',         float(row['b_score'])         if row['b_score']         else None),
-            ('d_score',         float(row['d_score'])         if row['d_score']         else None),
-            ('composite_score', float(row['composite_score']) if row['composite_score'] else None),
-            ('ai_feedback',     row['ai_feedback']),
-            ('submitted_at',    row['submitted_at'].isoformat())
+            ('q_id',             row['q_id']),
+            ('question_number',  row['question_number']),
+            ('question_text',    row['question']),
+            ('r_score',          float(row['r_score'])         if row['r_score']         is not None else None),
+            ('b_score',          float(row['b_score'])         if row['b_score']         is not None else None),
+            ('d_score',          float(row['d_score'])         if row['d_score']         is not None else None),
+            ('composite_score',  float(row['composite_score']) if row['composite_score'] is not None else None),
+            ('ai_feedback',      row['ai_feedback']),
+            ('question_reframe', row['question_reframe']),
+            ('submitted_at',     row['submitted_at'].isoformat())
         ]))
 
     feedback = [
@@ -1953,10 +2059,28 @@ def getStudentQuestions(user_id, db, metadata, assmt_id, student_id):
         for row in feedback_rows
     ]
 
+    questions_submitted = len(questions)
+    top_score = max(
+        (q['composite_score'] for q in questions if q['composite_score'] is not None),
+        default=None
+    )
+
+    avg_scores = None
+    if student_row:
+        avg_scores = OrderedDict([
+            ('avg_composite_score', float(student_row['avg_composite_score']) if student_row['avg_composite_score'] is not None else None),
+            ('avg_r_score',         float(student_row['avg_r_score'])         if student_row['avg_r_score']         is not None else None),
+            ('avg_b_score',         float(student_row['avg_b_score'])         if student_row['avg_b_score']         is not None else None),
+            ('avg_d_score',         float(student_row['avg_d_score'])         if student_row['avg_d_score']         is not None else None),
+        ])
+
     return OrderedDict([
-        ('student_id', student_id),
-        ('questions',  questions),
-        ('feedback',   feedback)
+        ('student_id',          student_id),
+        ('questions_submitted', questions_submitted),
+        ('top_score',           top_score),
+        ('avg_scores',          avg_scores),
+        ('questions',           questions),
+        ('feedback',            feedback)
     ])
 
 

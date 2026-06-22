@@ -1,5 +1,6 @@
 import json
 import os
+from datetime import datetime
 from flask import Blueprint, Response, jsonify, request, current_app, stream_with_context
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
@@ -18,6 +19,7 @@ curiosity_student = Blueprint('curiosity_student', __name__, url_prefix='/curios
 def getCuriosityAssessmentDetailsAndLiveQuestionCards(user):
     student_id = user.get('user_id')
     ca_id      = request.args.get('ca_id')
+    mode       = request.args.get('mode')
 
     if not ca_id:
         return jsonify({"status": 422, "message": "ca_id is missing"})
@@ -25,11 +27,13 @@ def getCuriosityAssessmentDetailsAndLiveQuestionCards(user):
         ca_id = int(ca_id)
     except ValueError:
         return jsonify({"status": 422, "message": "ca_id must be an integer"})
+    if mode not in ('preview', 'live'):
+        return jsonify({"status": 422, "message": "mode must be 'preview' or 'live'"})
 
     try:
         db = get_db()
         status, message, data = curiosity_assessment_student_data.getLiveAssessmentDetailsAndQuestionCards(
-            student_id, ca_id, db, metadata
+            student_id, ca_id, mode, db, metadata
         )
         if data is not None:
             return jsonify({"status": status, "message": message, "data": data})
@@ -162,7 +166,11 @@ def evaluateCuriosityAssessmentQuestions(user):
                 # receives a single merged dict with scores + coaching fields
                 if chunk.get("stage") != "done":
                     eval_result.update(chunk)
-                yield "data: {}\n\n".format(json.dumps(chunk))
+                # Coaching fields (verdict, feedback, reframe) are saved to DB
+                # and revealed only via /getCuriosityAssessmentEndResults —
+                # never streamed to the client during a live assessment
+                if chunk.get("stage") != "coaching":
+                    yield "data: {}\n\n".format(json.dumps(chunk))
 
             # Stream complete — persist question, update averages, flush Redis
             curiosity_assessment_student_data.saveQuestionEvaluation(
@@ -204,3 +212,52 @@ def evaluateCuriosityAssessmentQuestions(user):
     )
 
 
+# ── Route — /endCuriosityAssessmentForStudent (PATCH) ────────────────────────
+
+@curiosity_student.route('/endCuriosityAssessmentForStudent', methods=['PATCH'])
+@authorize
+def endCuriosityAssessmentForStudent(user):
+    now = datetime.utcnow()
+    student_id = user.get('user_id')
+    ca_id      = request.args.get('ca_id')
+    body       = request.get_json(silent=True) or {}
+    trigger    = body.get('trigger')
+
+    if not ca_id:
+        return jsonify({"status": 422, "message": "ca_id is missing"})
+    try:
+        ca_id = int(ca_id)
+    except (ValueError, TypeError):
+        return jsonify({"status": 422, "message": "ca_id must be an integer"})
+    if trigger not in ('button', 'timer'):
+        return jsonify({"status": 422, "message": "trigger must be 'button' or 'timer'"})
+
+    # Capture now before DB operations so elapsed reflects request-arrival time,
+    # not post-query time — prevents a slow DB round-trip from inflating elapsed
+    # and allowing a legitimately-early timer trigger to pass the expiry check.
+
+    try:
+        db = get_db()
+        status, message = curiosity_assessment_student_data.endCuriosityAssessment(
+            student_id, ca_id, trigger, now, db, metadata
+        )
+        return jsonify({"status": status, "message": message})
+
+    except Exception as e:
+        subject = "server:- {}, Error in /curiosity-student/endCuriosityAssessmentForStudent".format(
+            os.environ.get('FLASK_ENV')
+        )
+        try:
+            sg_client = SendGridAPIClient(os.environ.get('SENDGRID_API_KEY'))
+            sg_client.send(Mail(
+                from_email='noreply@edwisely.com',
+                to_emails='alerts@edwisely.com',
+                subject=subject,
+                plain_text_content=str(e)
+            ))
+        except Exception:
+            pass
+        current_app.logger.error(
+            '/curiosity-student/endCuriosityAssessmentForStudent - EXCEPTION: {}'.format(e)
+        )
+        return jsonify({"status": 500, "message": str(e)})

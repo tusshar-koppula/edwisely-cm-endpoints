@@ -1363,18 +1363,22 @@ def call_evaluator_streaming(
         f"Find passages that explain the mechanisms, processes, concepts, tradeoffs "
         f"or constraints directly relevant to answering this question: {student_question}"
     )
+    t0 = time.perf_counter()
     chunks = retrieve_chunks(query=retrieval_query, vector_store_id=vector_store_id, max_results=7)
+    log.info("TIMING | retrieval=%.3fs chunks=%d", time.perf_counter() - t0, len(chunks))
     if not chunks:
         log.warning("RETRIEVAL: 0 chunks for vector_store_id=%s", vector_store_id)
 
     previous_questions = session_state.get("previous_questions", [])
+    t0 = time.perf_counter()
     gate_result = _call_gate(
         question=student_question,
         chunks=chunks,
         previous_questions=previous_questions,
     )
     log.info(
-        "Gate flag=%s premise=%s stop_reason=%s",
+        "TIMING | gate=%.3fs flag=%s premise=%s stop_reason=%s",
+        time.perf_counter() - t0,
         gate_result.get("flag"),
         gate_result.get("premise"),
         gate_result.get("stop_reason"),
@@ -1449,6 +1453,7 @@ def call_evaluator_streaming(
     valid_question = gate_result.get("valid_question") or student_question
 
     # Call 2: Scoring + post-processing
+    t0 = time.perf_counter()
     scoring_result = _call_scoring(
         valid_question=valid_question,
         chunks=chunks,
@@ -1456,6 +1461,7 @@ def call_evaluator_streaming(
         gate_result=gate_result,
         skip_bridging_bonus=skip_bridging_bonus,
     )
+    log.info("TIMING | evaluator=%.3fs", time.perf_counter() - t0)
     if scoring_result is None:
         fb = build_fallback_response()
         fb["stage"] = "complete"
@@ -1476,19 +1482,11 @@ def call_evaluator_streaming(
         yield fb
         return
 
-    if scoring_result["routing_branch"] == "C-STEER":
-        prev_params = session_state.get("previous_scaffold", {}).get("parameters", [])
-        scoring_result["scaffold_parameters"] = _build_scaffold_parameters(
-            current_topic=scoring_result.get("current_topic", ""),
-            scaffold_strategy=scoring_result["scaffold_strategy"],
-            previous_parameters=prev_params,
-        )
-    else:
-        scoring_result["scaffold_parameters"] = []
-
     scores = scoring_result["scores"]
 
     # ── Yield 1: scores ready — client can render verdict bar immediately ──
+    # Scaffold parameters are NOT included here — they're only needed by the
+    # feedback call. Building them after this yield avoids blocking the client.
     yield {
         "stage":           "scores",
         "scores":          scores,
@@ -1500,39 +1498,66 @@ def call_evaluator_streaming(
         "chain_of_thought": scoring_result.get("chain_of_thought", {}),
     }
 
+    # Build scaffold parameters after yielding scores — this LLM call only
+    # runs for C-STEER and is needed by feedback, not by the scores chunk
+    if scoring_result["routing_branch"] == "C-STEER":
+        prev_params = session_state.get("previous_scaffold", {}).get("parameters", [])
+        scoring_result["scaffold_parameters"] = _build_scaffold_parameters(
+            current_topic=scoring_result.get("current_topic", ""),
+            scaffold_strategy=scoring_result["scaffold_strategy"],
+            previous_parameters=prev_params,
+        )
+    else:
+        scoring_result["scaffold_parameters"] = []
+
     # Calls 3 + 4: Feedback & Reframe — concurrent threads
     def _run_feedback():
-        return _call_feedback(
+        t_fb = time.perf_counter()
+        result = _call_feedback(
             question=valid_question,
             chunks=chunks,
             scoring_result=scoring_result,
             gate_result=gate_result,
             session_state=session_state,
         )
+        log.info("TIMING | feedback=%.3fs", time.perf_counter() - t_fb)
+        return result
 
     def _run_reframe():
         if scoring_result.get("routing_branch") == "B":
             log.info("Reframe suppressed (Branch B)")
             return _REFRAME_FALLBACK.copy()
-        return _call_reframe(
+        t_rf = time.perf_counter()
+        result = _call_reframe(
             student_question=valid_question,
             chunks=chunks,
             scoring_result=scoring_result,
             gate_result=gate_result,
         )
+        log.info("TIMING | reframe=%.3fs", time.perf_counter() - t_rf)
+        return result
 
+    t0 = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         f_future = executor.submit(_run_feedback)
         r_future = executor.submit(_run_reframe)
+
+        # Wait for feedback first — verdict comes from here
         feedback_result = f_future.result()
-        reframe_result  = r_future.result()
+        verdict_label   = feedback_result.get("verdict") or ""
+
+        # Yield verdict to client as soon as feedback is done;
+        # reframe may still be running concurrently
+        yield {"stage": "verdict", "verdict": verdict_label}
+
+        reframe_result = r_future.result()
+    log.info("TIMING | feedback+reframe_wall=%.3fs", time.perf_counter() - t0)
 
     coach_feedback      = (
         feedback_result.get("coach_feedback")
         or feedback_result.get("feedback")
         or "Good thinking — keep engaging with the material."
     )
-    verdict_label       = feedback_result.get("verdict") or ""
     diagnosis_text      = feedback_result.get("diagnosis") or ""
     reframed_question   = reframe_result.get("reframed_question") or None
     student_must_decide = reframe_result.get("student_must_decide") or None
@@ -1545,10 +1570,9 @@ def call_evaluator_streaming(
         time.perf_counter() - t_start,
     )
 
-    # ── Yield 2: coaching ready — feedback + reframe finished ──
+    # Coaching data accumulated by endpoint for DB save — not forwarded to client
     yield {
         "stage":           "coaching",
-        "verdict":         verdict_label,
         "feedback":        coach_feedback,
         "diagnosis":       diagnosis_text,
         "reframed_question":   reframed_question,
@@ -1558,5 +1582,4 @@ def call_evaluator_streaming(
             "parameters": scoring_result["scaffold_parameters"],
         },
     }
-# SEND END RESPONSE ONLY WHEN ASSESSMENT IS COMPLETE
     yield {"stage": "done"}

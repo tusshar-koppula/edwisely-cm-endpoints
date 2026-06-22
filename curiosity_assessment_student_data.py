@@ -1,8 +1,15 @@
 import json
+import logging
+import os
+import time
 from sqlalchemy import select, and_, update, func
 from datetime import datetime, timezone
+from openai import OpenAI
 from redis_client import redis_client
 from curiosity_assessment_evaluation import update_topic_coverage
+
+log     = logging.getLogger(__name__)
+_openai = OpenAI(api_key=os.environ.get('OPENAI_API_KEY'))
 
 _REDIS_SESSION_TTL = 7200   # 2 hours
 
@@ -86,69 +93,109 @@ def _apply_session_mutations(session_state, question_text, eval_result):
 #   (200, message, data)   on success
 #   (4xx, message, None)   on business-rule failure
 #
-# Side effect on first call only: records started_at and flips status →
-# 'writing' in ca_has_students, anchoring the server-side countdown timer.
-# Every subsequent call recomputes seconds_remaining from that anchor, so the
-# timer survives page refreshes and reconnections.
+# mode=preview  requires student status to be 'not_started'; returns only
+#               question_count and duration_minutes. No writes.
+#
+# mode=live     on first entry flips student status → 'writing' and anchors
+#               started_at for the server-side countdown. On re-entry (page
+#               refresh) recomputes seconds_remaining from the anchor. Returns
+#               full assessment details + previously scored question cards.
+#
+# Single JOIN query serves both modes; live mode additionally resolves
+# subject_name via a correlated scalar subquery in the same round-trip.
 # ─────────────────────────────────────────────────────────────────────────────
-def getLiveAssessmentDetailsAndQuestionCards(student_id, ca_id, db, metadata):
-    curiosity_assessment    = metadata.tables['curiosity_assessment']
-    ca_has_students         = metadata.tables['ca_has_students']
-    ca_question_submissions = metadata.tables['ca_question_submissions']
+def getLiveAssessmentDetailsAndQuestionCards(student_id, ca_id, mode, db, metadata):
+    curiosity_assessment = metadata.tables['curiosity_assessment']
+    ca_has_students      = metadata.tables['ca_has_students']
 
-    # 1. Fetch assessment row
-    assmt = db.execute(
-        select(curiosity_assessment).where(
-            and_(
-                curiosity_assessment.c.assmt_id == ca_id,
-                curiosity_assessment.c.is_deleted == 0
+    # Base columns needed by both modes
+    cols = [
+        curiosity_assessment.c.assmt_id,
+        curiosity_assessment.c.status.label('assmt_status'),
+        curiosity_assessment.c.question_count,
+        curiosity_assessment.c.duration_minutes,
+        ca_has_students.c.status.label('student_status'),
+        ca_has_students.c.started_at,
+    ]
+
+    if mode == 'live':
+        college_subject_mapping = metadata.tables['college_subject_mapping']
+        subject_semester_new    = metadata.tables['subject_semester_new']
+        subject_master          = metadata.tables['subject_master']
+
+        subject_name_sub = (
+            select(subject_master.c.name)
+            .select_from(
+                college_subject_mapping
+                .join(subject_semester_new, subject_semester_new.c.id == college_subject_mapping.c.subject_semester_id)
+                .join(subject_master, subject_master.c.id == subject_semester_new.c.subject_master_id)
             )
+            .where(college_subject_mapping.c.subject_code == curiosity_assessment.c.subject_code)
+            .limit(1)
+            .correlate(curiosity_assessment)
+            .scalar_subquery()
         )
+
+        cols += [
+            curiosity_assessment.c.assmt_title,
+            curiosity_assessment.c.source_kind,
+            curiosity_assessment.c.doc_name,
+            curiosity_assessment.c.doc_storage_url,
+            subject_name_sub.label('subject_name'),
+        ]
+
+    row = db.execute(
+        select(*cols)
+        .join(ca_has_students, and_(
+            ca_has_students.c.ca_id      == curiosity_assessment.c.assmt_id,
+            ca_has_students.c.student_id == student_id,
+        ))
+        .where(and_(
+            curiosity_assessment.c.assmt_id   == ca_id,
+            curiosity_assessment.c.is_deleted == 0,
+        ))
     ).mappings().fetchone()
 
-    if not assmt:
-        return 400, "Assessment not found", None
+    if not row:
+        return 400, "Assessment not found or student not enrolled", None
 
-    if assmt['status'] != 'live':
+    if row['assmt_status'] != 'live':
         return 400, "Assessment is not currently live", None
 
-    # 2. Confirm student is enrolled
-    student_row = db.execute(
-        select(ca_has_students).where(
-            and_(
-                ca_has_students.c.ca_id      == ca_id,
-                ca_has_students.c.student_id == student_id
-            )
-        )
-    ).mappings().fetchone()
+    # ── Preview branch ────────────────────────────────────────────────────────
+    if mode == 'preview':
+        if row['student_status'] != 'not_started':
+            return 400, "Preview is only available before the assessment is started", None
 
-    if not student_row:
-        return 403, "Student is not enrolled in this assessment", None
+        return 200, "Successfully fetched data", {
+            "question_count":   row['question_count'],
+            "duration_minutes": row['duration_minutes'],
+        }
 
-    if student_row['status'] == 'submitted':
+    # ── Live branch ───────────────────────────────────────────────────────────
+    if row['student_status'] == 'submitted':
         return 400, "Assessment already submitted", None
 
-    # 3. Timer anchor: set started_at on first entry, recompute on re-entry
     now = _utcnow()
-    if student_row['started_at'] is None:
+    if row['started_at'] is None:
         db.execute(
-            update(ca_has_students).where(
-                and_(
-                    ca_has_students.c.ca_id      == ca_id,
-                    ca_has_students.c.student_id == student_id
-                )
-            ).values(started_at=now, status='writing')
+            update(ca_has_students)
+            .where(and_(
+                ca_has_students.c.ca_id      == ca_id,
+                ca_has_students.c.student_id == student_id,
+            ))
+            .values(started_at=now, status='writing')
         )
         db.commit()
         started_at = now
     else:
-        started_at = student_row['started_at']
+        started_at = row['started_at']
 
-    total_seconds    = assmt['duration_minutes'] * 60
-    elapsed          = int((now - started_at).total_seconds())
-    seconds_remaining = max(0, total_seconds - elapsed)
+    elapsed           = int((now - started_at).total_seconds())
+    seconds_remaining = max(0, row['duration_minutes'] * 60 - elapsed)
 
-    # 4. Fetch previously scored question cards for this student
+    ca_question_submissions = metadata.tables['ca_question_submissions']
+
     q_rows = db.execute(
         select(
             ca_question_submissions.c.q_id,
@@ -158,32 +205,29 @@ def getLiveAssessmentDetailsAndQuestionCards(student_id, ca_id, db, metadata):
             ca_question_submissions.c.b_score,
             ca_question_submissions.c.d_score,
             ca_question_submissions.c.composite_score,
-            ca_question_submissions.c.verdict
-        ).where(
-            and_(
-                ca_question_submissions.c.ca_id      == ca_id,
-                ca_question_submissions.c.student_id == student_id
-            )
-        ).order_by(ca_question_submissions.c.question_number)
+            ca_question_submissions.c.verdict,
+        )
+        .where(and_(
+            ca_question_submissions.c.ca_id      == ca_id,
+            ca_question_submissions.c.student_id == student_id,
+        ))
+        .order_by(ca_question_submissions.c.question_number)
     ).mappings().all()
 
-    # 5. Build response
-    # doc_url is None when source_kind = 'topic'; S3 generation for topic-based
-    # passages is handled asynchronously before the test starts (handled separately).
     data = {
         "assessment": {
-            "ca_id":            assmt['assmt_id'],
-            "title":            assmt['assmt_title'],
-            "subject_code":     assmt['subject_code'],
-            "question_count":   assmt['question_count'],
-            "duration_minutes": assmt['duration_minutes'],
-            "source_kind":     assmt['source_kind'],
-            "doc_name":         assmt['doc_name'],
-            "doc_url":          assmt['doc_storage_url']
+            "ca_id":            row['assmt_id'],
+            "title":            row['assmt_title'],
+            "subject_name":     row['subject_name'],
+            "question_count":   row['question_count'],
+            "duration_minutes": row['duration_minutes'],
+            "source_kind":      row['source_kind'],
+            "doc_name":         row['doc_name'],
+            "doc_url":          row['doc_storage_url'],
         },
         "attempt": {
             "status":            "writing",
-            "seconds_remaining": seconds_remaining
+            "seconds_remaining": seconds_remaining,
         },
         "question_cards": [
             {
@@ -194,13 +238,13 @@ def getLiveAssessmentDetailsAndQuestionCards(student_id, ca_id, db, metadata):
                 "b_score":         float(q['b_score'])         if q['b_score']         is not None else None,
                 "d_score":         float(q['d_score'])         if q['d_score']         is not None else None,
                 "composite_score": float(q['composite_score']) if q['composite_score'] is not None else None,
-                "verdict":         q['verdict']
+                "verdict":         q['verdict'],
             }
             for q in q_rows
-        ]
+        ],
     }
 
-    return 200, "Successfully fetched Data", data
+    return 200, "Successfully fetched data", data
 
 
 # ── /getCuriosityAssessmentEndResults ────────────────────────────────────────
@@ -409,6 +453,19 @@ def getEvaluationContext(student_id, ca_id, db, metadata):
         return 400, "AI evaluation is only available for document-based assessments", None
     if not row['vector_store_id']:
         return 503, "Document is still being indexed — please try again shortly", None
+
+    vs_id     = row['vector_store_id']
+    vs_status = redis_client.get("ca_vs_ready:{}".format(vs_id))
+    if vs_status == b'failed':
+        return 503, "Document indexing failed — please ask your faculty to re-upload the document", None
+    if vs_status != b'1':
+        # Redis key absent: background thread hasn't finished yet, or Redis was
+        # restarted. Do a single live check against OpenAI rather than blocking.
+        vs_files = list(_openai.vector_stores.files.list(vs_id))
+        if vs_files and all(f.status == 'completed' for f in vs_files):
+            redis_client.set("ca_vs_ready:{}".format(vs_id), "1", ex=86400)
+        else:
+            return 503, "Document is still being indexed — please try again shortly", None
     if row['student_status'] == 'submitted':
         return 400, "Assessment already submitted", None
     if row['student_status'] == 'not_started':
@@ -462,6 +519,7 @@ def saveQuestionEvaluation(student_id, ca_id, question_text, question_number, ev
 
     scores = eval_result.get("scores", {})
     now    = _utcnow()
+    t_save = time.perf_counter()
 
     try:
         db.execute(
@@ -511,6 +569,7 @@ def saveQuestionEvaluation(student_id, ca_id, question_text, question_number, ev
         )
 
         db.commit()
+        log.info("TIMING | saveQuestionEvaluation_db=%.3fs", time.perf_counter() - t_save)
     except Exception:
         db.rollback()
         raise
@@ -523,3 +582,88 @@ def saveQuestionEvaluation(student_id, ca_id, question_text, question_number, ev
         json.dumps(session_state),
         ex=_REDIS_SESSION_TTL,
     )
+
+
+# ── /endCuriosityAssessmentForStudent ─────────────────────────────────────────
+# Returns:
+#   (200, message)   on success or idempotent already-submitted
+#   (4xx, message)   on business-rule failure
+#
+# now is captured in the endpoint before any DB calls so that elapsed reflects
+# request-arrival time. A slow DB round-trip would otherwise inflate elapsed
+# and allow a legitimately-early timer trigger to pass the expiry check.
+#
+# Idempotency: the conditional UPDATE (WHERE status='writing') is the atomic
+# guard. If button and timer fire simultaneously, only one request flips the
+# row; the other sees rowcount=0, re-reads, finds 'submitted', and returns 200.
+# ─────────────────────────────────────────────────────────────────────────────
+def endCuriosityAssessment(student_id, ca_id, trigger, now, db, metadata):
+    curiosity_assessment = metadata.tables['curiosity_assessment']
+    ca_has_students      = metadata.tables['ca_has_students']
+
+    row = db.execute(
+        select(
+            curiosity_assessment.c.duration_minutes,
+            ca_has_students.c.status.label('student_status'),
+            ca_has_students.c.started_at,
+        )
+        .join(ca_has_students, and_(
+            ca_has_students.c.ca_id      == curiosity_assessment.c.assmt_id,
+            ca_has_students.c.student_id == student_id,
+        ))
+        .where(and_(
+            curiosity_assessment.c.assmt_id   == ca_id,
+            curiosity_assessment.c.is_deleted == 0,
+        ))
+    ).mappings().fetchone()
+
+    if not row:
+        return 400, "Assessment not found or student not enrolled"
+
+    if row['student_status'] == 'submitted':
+        return 200, "Assessment already submitted"
+
+    if row['student_status'] == 'not_started':
+        return 400, "Assessment has not been started"
+
+    elapsed_seconds = (now - row['started_at']).total_seconds()
+
+    if trigger == 'timer' and elapsed_seconds < row['duration_minutes'] * 60:
+        return 400, "Timer has not expired yet"
+
+    time_elapsed_seconds = (
+        row['duration_minutes'] * 60 if trigger == 'timer'
+        else int(elapsed_seconds)
+    )
+
+    result = db.execute(
+        update(ca_has_students)
+        .where(and_(
+            ca_has_students.c.ca_id      == ca_id,
+            ca_has_students.c.student_id == student_id,
+            ca_has_students.c.status     == 'writing',
+        ))
+        .values(
+            status               = 'submitted',
+            submitted_at         = now,
+            time_elapsed_seconds = time_elapsed_seconds,
+        )
+    )
+
+    if result.rowcount == 0:
+        db.rollback()
+        # Race: another concurrent request already flipped the row — re-read to confirm
+        recheck = db.execute(
+            select(ca_has_students.c.status)
+            .where(and_(
+                ca_has_students.c.ca_id      == ca_id,
+                ca_has_students.c.student_id == student_id,
+            ))
+        ).mappings().fetchone()
+        if recheck and recheck['status'] == 'submitted':
+            return 200, "Assessment already submitted"
+        return 500, "Failed to end assessment — please try again"
+
+    db.commit()
+    redis_client.delete(_redis_session_key(ca_id, student_id))
+    return 200, "Assessment ended successfully"

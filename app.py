@@ -1,8 +1,14 @@
 import os
+import logging
 from flask import Flask, g
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(name)s: %(message)s',
+)
 
 app = Flask(__name__)
 app.config['FLASK_ENV'] = os.environ.get('FLASK_ENV', 'development')
