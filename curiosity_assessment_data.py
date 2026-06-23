@@ -30,6 +30,17 @@ _S3_BUCKET = os.environ.get('S3_BUCKET_NAME')
 _openai = OpenAI(api_key=os.environ.get('OPENAI_API_KEY'))
 
 
+def _presign_doc(s3_key, expiry=86400):
+    """Return a 24-hour presigned GET URL for a private S3 object, or None if no key."""
+    if not s3_key:
+        return None
+    return _s3.generate_presigned_url(
+        'get_object',
+        Params={'Bucket': _S3_BUCKET, 'Key': s3_key},
+        ExpiresIn=expiry,
+    )
+
+
 # ============================================================
 # NOTE ON db / metadata
 # These are injected by the route layer (same pattern as
@@ -466,6 +477,7 @@ def duplicateAssessment(user_id, db, metadata, assmt_id):
                 doc_storage_url  = src['doc_storage_url'],
                 doc_pages        = src['doc_pages'],
                 doc_size_bytes   = src['doc_size_bytes'],
+                vector_store_id  = src['vector_store_id'],
                 rubric_relevance_limit = src['rubric_relevance_limit'],
                 rubric_blooms_limit    = src['rubric_blooms_limit'],
                 rubric_depth_limit     = src['rubric_depth_limit'],
@@ -524,6 +536,44 @@ def duplicateAssessment(user_id, db, metadata, assmt_id):
     except Exception:
         db.rollback()
         raise
+
+    # For document-mode assessments: copy the S3 file and spin up a fresh vector
+    # store so the duplicate is fully independent of the source.
+    if src['source_kind'] == 'document' and src['doc_s3_key']:
+        try:
+            doc_name   = src['doc_name'] or 'document.pdf'
+            new_s3_key = 'ca_documents/{}/{}__{}'.format(user_id, new_id, doc_name)
+
+            _s3.copy_object(
+                CopySource={'Bucket': _S3_BUCKET, 'Key': src['doc_s3_key']},
+                Bucket=_S3_BUCKET,
+                Key=new_s3_key,
+            )
+
+            new_vs = _openai.vector_stores.create(
+                name='ca_doc_{}'.format(uuid.uuid4().hex[:8]),
+                expires_after={'anchor': 'last_active_at', 'days': 365},
+            )
+
+            db.execute(
+                curiosity_assessment.update()
+                .where(curiosity_assessment.c.assmt_id == new_id)
+                .values(doc_s3_key=new_s3_key, vector_store_id=new_vs.id)
+            )
+            db.commit()
+
+            file_bytes = _s3.get_object(Bucket=_S3_BUCKET, Key=new_s3_key)['Body'].read()
+            log.info(
+                "Vector store indexing started for duplicate | assmt_id=%d vector_store_id=%s filename=%s",
+                new_id, new_vs.id, doc_name,
+            )
+            threading.Thread(
+                target=_ingest_to_vector_store,
+                args=(new_vs.id, file_bytes, doc_name),
+                daemon=True,
+            ).start()
+        except Exception as exc:
+            log.error("Failed to copy document for duplicate assmt_id=%d: %s", new_id, exc)
 
     return _fetchAssessmentById(new_id, db, metadata)
 
@@ -1053,13 +1103,16 @@ def _ingest_to_vector_store(vector_store_id, file_bytes, filename):
         redis_client.set("ca_vs_ready:{}".format(vector_store_id), "failed", ex=_VS_FAILED_TTL)
 
 
-def uploadDocument(user_id, db, metadata, file):
+def uploadDocument(user_id, db, metadata, file, assmt_id=None):
     filename   = file.filename
     file_bytes = file.read()
     size_bytes = len(file_bytes)
 
     pages  = len(PdfReader(io.BytesIO(file_bytes)).pages)
-    s3_key = 'ca_documents/{}/{}__{}'.format(user_id, uuid.uuid4().hex, filename)
+    # assmt_id is the stable unique identifier per document (1 doc per assessment).
+    # Falls back to UUID only on initial creation (POST) when assmt_id is not yet known.
+    identifier = assmt_id if assmt_id else uuid.uuid4().hex
+    s3_key = 'ca_documents/{}/{}__{}'.format(user_id, identifier, filename)
 
     _s3.upload_fileobj(
         io.BytesIO(file_bytes),
@@ -1078,6 +1131,10 @@ def uploadDocument(user_id, db, metadata, file):
     )
     vector_store_id = vs.id
 
+    log.info(
+        "Vector store indexing started | vector_store_id=%s filename=%s size_bytes=%d",
+        vector_store_id, filename, size_bytes,
+    )
     # Upload PDF content to vector store in background — chunking/indexing takes time
     threading.Thread(
         target=_ingest_to_vector_store,
@@ -1482,7 +1539,7 @@ def _fetchAssessmentById(assmt_id, db, metadata):
     result['subject_code']     = row['subject_code']
     result['doc_name']         = row['doc_name']
     result['doc_s3_key']       = row['doc_s3_key']
-    result['doc_storage_url']  = row['doc_storage_url']
+    result['doc_storage_url']  = _presign_doc(row['doc_s3_key'])
     result['doc_pages']        = row['doc_pages']
     result['doc_size_bytes']   = row['doc_size_bytes']
     result['question_count']   = row['question_count']
@@ -1548,6 +1605,7 @@ def getAssessmentByID(user_id, db, metadata, assmt_id):
             curiosity_assessment.c.doc_name,
             curiosity_assessment.c.doc_size_bytes,
             curiosity_assessment.c.doc_pages,
+            curiosity_assessment.c.doc_s3_key,
             curiosity_assessment.c.doc_storage_url.label('doc_url'),
         )
         .select_from(
@@ -1593,7 +1651,7 @@ def getAssessmentByID(user_id, db, metadata, assmt_id):
             ('name',        first['doc_name']),
             ('size_bytes',  first['doc_size_bytes']),
             ('pages',       first['doc_pages']),
-            ('url',         first['doc_url']),
+            ('url',         _presign_doc(first['doc_s3_key'])),
         ]) if first['doc_name'] else None
 
     elif source_kind == 'topic':
@@ -1717,6 +1775,7 @@ def getAssessmentStats(user_id, db, metadata, assmt_id, sort=None):
             curiosity_assessment.c.source_kind,
             curiosity_assessment.c.subject_code,
             curiosity_assessment.c.doc_name,
+            curiosity_assessment.c.doc_s3_key,
             curiosity_assessment.c.doc_storage_url,
             curiosity_assessment.c.doc_pages,
             curiosity_assessment.c.question_count,
@@ -1841,7 +1900,7 @@ def getAssessmentStats(user_id, db, metadata, assmt_id, sort=None):
         syllabus = OrderedDict([
             ('source_kind', 'document'),
             ('name',        first['doc_name']),
-            ('url',         first['doc_storage_url']),
+            ('url',         _presign_doc(first['doc_s3_key'])),
             ('pages',       first['doc_pages'])
         ])
 
@@ -2200,7 +2259,7 @@ def getAssessmentSyllabus(user_id, db, metadata, assmt_id):
                 curiosity_assessment.c.doc_name,
                 curiosity_assessment.c.doc_size_bytes,
                 curiosity_assessment.c.doc_pages,
-                curiosity_assessment.c.doc_storage_url
+                curiosity_assessment.c.doc_s3_key
             )
             .where(curiosity_assessment.c.assmt_id == assmt_id)
         ).mappings().first()
@@ -2210,7 +2269,7 @@ def getAssessmentSyllabus(user_id, db, metadata, assmt_id):
             ('name',       doc_row['doc_name']),
             ('size_bytes', doc_row['doc_size_bytes']),
             ('pages',      doc_row['doc_pages']),
-            ('url',        doc_row['doc_storage_url'])
+            ('url',        _presign_doc(doc_row['doc_s3_key']))
         ])
     return getAssessmentTopics(db, metadata, assmt_id)
 

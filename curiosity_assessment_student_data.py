@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from openai import OpenAI
 from redis_client import redis_client
 from curiosity_assessment_evaluation import update_topic_coverage
+from curiosity_assessment_data import _presign_doc
 
 log     = logging.getLogger(__name__)
 _openai = OpenAI(api_key=os.environ.get('OPENAI_API_KEY'))
@@ -140,7 +141,7 @@ def getLiveAssessmentDetailsAndQuestionCards(student_id, ca_id, mode, db, metada
             curiosity_assessment.c.assmt_title,
             curiosity_assessment.c.source_kind,
             curiosity_assessment.c.doc_name,
-            curiosity_assessment.c.doc_storage_url,
+            curiosity_assessment.c.doc_s3_key,
             subject_name_sub.label('subject_name'),
         ]
 
@@ -223,7 +224,7 @@ def getLiveAssessmentDetailsAndQuestionCards(student_id, ca_id, mode, db, metada
             "duration_minutes": row['duration_minutes'],
             "source_kind":      row['source_kind'],
             "doc_name":         row['doc_name'],
-            "doc_url":          row['doc_storage_url'],
+            "doc_url":          _presign_doc(row['doc_s3_key']),
         },
         "attempt": {
             "status":            "writing",
@@ -295,7 +296,7 @@ def getCuriosityAssessmentEndResults(student_id, ca_id, db, metadata):
             curiosity_assessment.c.duration_minutes,
             curiosity_assessment.c.source_kind,
             curiosity_assessment.c.doc_name,
-            curiosity_assessment.c.doc_storage_url,
+            curiosity_assessment.c.doc_s3_key,
             ca_has_students.c.status,
             ca_has_students.c.avg_r_score,
             ca_has_students.c.avg_b_score,
@@ -372,7 +373,7 @@ def getCuriosityAssessmentEndResults(student_id, ca_id, db, metadata):
             "duration_minutes": row['duration_minutes'],
             "source_kind":     row['source_kind'],
             "doc_name":         row['doc_name'],
-            "doc_url":          row['doc_storage_url']
+            "doc_url":          _presign_doc(row['doc_s3_key'])
         },
         "attempt_summary": {
             "questions_submitted":  questions_submitted,

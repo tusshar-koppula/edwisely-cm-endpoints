@@ -151,7 +151,9 @@ def createOrUpdateAssessment(user):
         db          = get_db()
         doc_info = None
         if request.files.get('file'):
-            doc_info = curiosity_assessment_data.uploadDocument(user_id, db, metadata, request.files.get('file'))
+            assmt_id_for_upload = request.form.get('assessment_id')
+            assmt_id_for_upload = int(assmt_id_for_upload) if assmt_id_for_upload and assmt_id_for_upload.isdigit() else None
+            doc_info = curiosity_assessment_data.uploadDocument(user_id, db, metadata, request.files.get('file'), assmt_id=assmt_id_for_upload)
     except Exception as e:
         subject = "server:- {}, Error in /createOrUpdateCuriosityAssessments".format(os.environ.get('FLASK_ENV'))
         try:

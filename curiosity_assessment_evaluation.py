@@ -239,7 +239,7 @@ The deciding test: Could a student fully answer the current question by taking t
 ---
 
 <scratchpad>
-Before emitting JSON, write your reasoning here under each heading. Follow the steps in order. Stop and emit JSON as soon as a hard-stop fires. Do not skip steps.
+Use these steps as your internal reasoning framework. Work through them in sequence, stopping at the first hard-stop.
 
 ## STEP 1 — PASTE CHECK (Case 1 · hard stop)
   -> Identify every sentence in the submission. Label each as:
@@ -271,14 +271,12 @@ Before emitting JSON, write your reasoning here under each heading. Follow the s
 ## MATCHED CASE
 ## PREMISE ARRAY
 ## FRAGMENT DECISION
-
----JSON BELOW---
 </scratchpad>
 
 ---
 
 <output_format>
-Emit exactly this JSON object after the scratchpad. After the closing `}`, output nothing.
+Once done reasoning through the scratchpad steps above, emit exactly this JSON object. After the closing `}`, output nothing.
 
 {
   "flag": "pass" | "fail",
@@ -286,8 +284,8 @@ Emit exactly this JSON object after the scratchpad. After the closing `}`, outpu
   "valid_question": "<student's genuine question text verbatim, or null>",
   "stop_reason": null | "pasted content" | "gamifying question" | "question is off-topic" | "resubmission" | "vague question",
   "note": "<one sentence: which case matched, which sub-case if applicable, and the specific reason why>",
-  "anchor_list": ["<concept>", "..."] | null,
-  "passage_links": [["<ConceptA>", "<ConceptB>"], "..."] | null
+  "anchor_list": ["<concept>", ...] | null,
+  "passage_links": [["<ConceptA>", "<ConceptB>"], ["<ConceptC>", "<ConceptD>"], ...] | null
 }
 </output_format>
 """.strip()
@@ -312,7 +310,7 @@ Read the passage and the student question. For each dimension below, decide what
 
 ## Step 1 — Anchor list
 
-The anchor list is a pre-built map of every concept the passage
+Read the `Anchor list` from the user message. It maps every concept the passage
 substantively covers. Use it in step 6 when scoring bridging bonus.
 
 ---
@@ -427,6 +425,7 @@ Use IDs only (e.g. "T1", "T3") — never free text.
     "bridging_bonus": <0 or 1>
   }
 }
+```
 """.strip()
 
 FEEDBACK_SYSTEM_PROMPT = """
@@ -477,6 +476,9 @@ Acknowledge something specific and real from their question, then open a concret
 ### Branch C-ENCOURAGE — Solid question
 Name what the student had to notice or reason through to form this question — specific, not generic. A second sentence is allowed only if there is a concrete next angle worth opening; do not fill it with praise alone.
 
+### Topic trajectory signal
+If `same_topic_streak >= 2` and `is_deepening = true`: the student is systematically drilling deeper into the same topic across questions. Acknowledge the trajectory explicitly in `coach_feedback` — name the progression, not just the current question.
+
 ---
 
 ## Output Fields
@@ -503,6 +505,17 @@ Return only this JSON object. No preamble, no markdown fences. After the closing
 
 { "verdict": "...", "coach_feedback": "...", "diagnosis": "..." }""".strip()
 
+SYNTHESIS_SYSTEM_PROMPT = """You are a passage synthesizer. Use the file_search tool to retrieve text chunks, then synthesize them into one coherent passage.
+
+Rules (strict):
+- Output ONLY content present in the retrieved chunks — do not add any external knowledge, inferences, or explanations
+- Preserve domain terminology, key phrases, and factual details verbatim where possible
+- Remove redundancy: merge overlapping chunks once; do not repeat the same point
+- Order content logically by concept flow
+- Do NOT answer the question — only distill and organize the retrieved chunk content
+- Output the synthesized passage only — no preamble, no headings, no chunk labels
+""".strip()
+
 REFRAME_SYSTEM_PROMPT = """You are a question-design engine for a student learning platform.
 Given a student's submitted question and its scoring context, produce one reframed question that a scoring engine will rate **higher in both Bloom's level and Depth** than the student's current scores.
 
@@ -518,6 +531,9 @@ Given a student's submitted question and its scoring context, produce one refram
 <planning_spec>
 Before writing the question, silently complete these steps in order — do not include them in your output.
 
+### Preliminary — Branch A check
+If `routing_branch = A`, the student's question was off-track and not grounded in the passage. Skip Steps 2–4. Instead, identify the concept in the passage that the student seemed most curious about and generate a question rooted entirely in passage content at the target cognitive level.
+
 ### Step 1 — Derive targets
 Compute `bloom_target` and `depth_target`:
 - `bloom_target` = `bloom_b` + 1 at minimum, capped at 6. Prefer +2 when the passage supports it.
@@ -525,7 +541,7 @@ Compute `bloom_target` and `depth_target`:
 - Coherence rules: if `bloom_target` ≥ 5, then `depth_target` must be ≥ 3. If `depth_target` = 4, then `bloom_target` must be ≥ 4.
 
 ### Step 2 — Find what the original question left unresolved
-Every question has a terminal demand — what the student must ultimately produce to fully answer it. Find the decision that terminal demand leads toward but never asks the student to make.
+Read `minimum_answer` from the user message — it describes what fully answering the current question requires. Use it to identify the terminal demand of the original question. Find the decision that terminal demand leads toward but never asks the student to make.
 
 ### Step 3 — Verify the open problem is genuinely unresolved at the target level
 The open problem must satisfy both conditions:
@@ -534,7 +550,7 @@ The open problem must satisfy both conditions:
 
 ### Step 4 — Verify the commitment differs from the original question's commitment
 Check: is the reframed commitment something a student could fulfill by restating or elaborating their answer to the original question?
-- Yes -> return to Step 2.
+- Yes -> return to Step 2. If you have already returned twice, select the most tractable option found so far and proceed.
 - No -> proceed.
 
 ### Step 5 — Write the question
@@ -555,7 +571,7 @@ Return only this JSON object. After the closing `}`, output nothing further.
   "student_must_decide": "<one phrase: the specific choice, judgment, or conclusion the student must commit to>",
   "bloom_target": <integer greater than bloom_b, range 1–6>,
   "depth_target": <integer greater than depth_d, range 1–4>,
-  "anchor_concepts_used": ["<concept>", "..."]
+  "anchor_concepts_used": ["<concept1>", "<concept2>", ...]
 }""".strip()
 
 SCAFFOLD_PARAM_PROMPT = """
@@ -568,8 +584,19 @@ Rules:
 - Each parameter must be a short noun phrase (2-5 words).
 - Do not repeat any parameter from the previous list.
 
+Scaffold strategy guidance:
+- bridging_scaffolding: generate parameters drawn from two distinct abstract domains — the student must find a way to connect them.
+- constraint_scaffolding: generate parameters that act as limiting boundary conditions on a system or process.
+
 Return only this JSON: { "parameters": ["<param 1>", "<param 2>"] }
 """.strip()
+
+_SCAFFOLD_FALLBACK_POOL = [
+    ["input rate",         "output threshold"],
+    ["variance magnitude", "critical ratio"],
+    ["transition period",  "boundary gradient"],
+    ["peak density",       "response duration"],
+]
 
 # ─────────────────────────────────────────────────────────────
 # Fallback constants
@@ -596,11 +623,12 @@ def retrieve_chunks(
     query: str,
     vector_store_id: str,
     max_results: int = 5,
-) -> list[str]:
+) -> dict[str, Any]:
     log.info("File Search query: %.50s | vector_store_id=%s", query, vector_store_id)
     try:
         response = _openai.responses.create(
             model=RETRIEVAL_MODEL,
+            instructions=SYNTHESIS_SYSTEM_PROMPT,
             input=query,
             tools=[
                 {
@@ -612,18 +640,21 @@ def retrieve_chunks(
             include=["file_search_call.results"],
         )
         chunks: list[str] = []
-        output_items = response.output or []
-        for item in output_items:
+        for item in (response.output or []):
             if getattr(item, "type", "") == "file_search_call":
-                results = getattr(item, "results", None) or []
-                for result in results:
+                for result in (getattr(item, "results", None) or []):
                     text = getattr(result, "text", None)
                     if text:
                         chunks.append(text)
-        chunks = chunks[:max_results]
-        chunks = [_strip_chunk_metadata(c) for c in chunks if c]
-        log.info("File Search retrieved %d chunks", len(chunks))
-        return chunks
+        chunks = [_strip_chunk_metadata(c) for c in chunks[:max_results] if c]
+        synthesis = _extract_response_text(response).strip()
+        if not synthesis and chunks:
+            synthesis = "\n\n".join(chunks)
+        log.info(
+            "File Search retrieved %d chunks | synthesis_len=%d",
+            len(chunks), len(synthesis),
+        )
+        return {"chunks": chunks, "synthesis": synthesis}
     except Exception as exc:
         error_str = str(exc)
         if "not found" in error_str.lower() or "404" in error_str:
@@ -633,7 +664,7 @@ def retrieve_chunks(
             )
         else:
             log.error("File Search retrieval failed: %s", exc)
-        return []
+        return {"chunks": [], "synthesis": ""}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -642,6 +673,7 @@ def retrieve_chunks(
 def _call_gate(
     question: str,
     chunks: list[str],
+    synthesis: str,
     previous_questions: list[dict],
 ) -> dict[str, Any]:
     context_str = "\n".join(f"{i+1}. {c}" for i, c in enumerate(chunks))
@@ -656,10 +688,10 @@ def _call_gate(
     )
     user_msg = (
         f"STUDENT QUESTION: {question}\n\n"
-        f"RETRIEVED CHUNKS:\n{context_str or '(none)'}\n"
+        f"RAW CHUNKS (use only for verbatim paste detection — Case 1):\n{context_str or '(none)'}\n\n"
+        f"SYNTHESIZED PASSAGE (use for off-topic check and all other reasoning — Cases 2–7):\n{synthesis or '(none)'}\n"
         f"{no_chunks_notice}\n"
-        f"PREVIOUS QUESTIONS THIS SESSION:\n{prev_q_str}\n\n"
-        f"Return a JSON object."
+        f"PREVIOUS QUESTIONS THIS SESSION:\n{prev_q_str}"
     )
     raw = ""
     for attempt in range(2):
@@ -674,7 +706,8 @@ def _call_gate(
             raw = _extract_response_text(response)
             result = _parse_json_payload(raw)
             log.info(
-                "Gate anchor_list: %s | passage_links: %s",
+                "Gate note=%s | anchor_list=%s | passage_links=%s",
+                result.get("note"),
                 result.get("anchor_list"),
                 result.get("passage_links"),
             )
@@ -691,28 +724,27 @@ def _call_gate(
 # ─────────────────────────────────────────────────────────────
 def _build_scoring_user_message(
     valid_question: str,
-    context_str: str,
+    synthesis: str,
     gate_result: dict[str, Any],
     skip_bridging_bonus: bool,
     previous_scores: list[dict],
     no_context_notice: str,
     topic_map: list[dict] | None = None,
 ) -> str:
-    previous_scores_str = json.dumps(previous_scores, indent=2) if previous_scores else "None"
+    previous_scores_str = json.dumps(previous_scores) if previous_scores else "None"
+    anchor_list_str = json.dumps(gate_result.get("anchor_list") or [])
     passage_links_str = json.dumps(gate_result.get("passage_links") or [])
-    topic_map_lines = []
-    for t in (topic_map or []):
-        topic_map_lines.append(f"{t['id']}: {t['canonical_label']}")
+    topic_map_lines = [f"{t['id']}: {t['canonical_label']}" for t in (topic_map or [])]
     topic_map_str = "\n".join(topic_map_lines) if topic_map_lines else "(none)"
     parts = [
         f"Student question: {valid_question}",
-        f"Gate result: {json.dumps(gate_result)}",
+        f"Anchor list (concepts the passage substantively covers): {anchor_list_str}",
         f"Passage links (concept pairs the passage already explicitly connects): {passage_links_str}",
         f"Skip bridging bonus: {str(skip_bridging_bonus).lower()}",
         f"Topic map (id -> label):\n{topic_map_str}",
         "",
         "Passage:",
-        context_str or "(none)",
+        synthesis or "(none)",
     ]
     if no_context_notice:
         parts.append(no_context_notice)
@@ -724,24 +756,23 @@ def _build_scoring_user_message(
         ),
         previous_scores_str,
         "",
-        "Evaluate the student question above against this passage. Return a JSON object.",
+        "Evaluate the student question above against this passage.",
     ]
     return "\n".join(parts)
 
 
 def _call_scoring(
     valid_question: str,
-    chunks: list[str],
+    synthesis: str,
     session_state: dict[str, Any],
     gate_result: dict[str, Any],
     skip_bridging_bonus: bool,
 ) -> dict[str, Any] | None:
-    context_str = "\n".join(f"{i + 1}. {c}" for i, c in enumerate(chunks))
     no_context_notice = (
-        "NOTE: The retrieval system returned 0 chunks. "
+        "NOTE: The retrieval system returned no passage. "
         "Evaluate on academic merit alone. "
         "Score R honestly — do not artificially inflate or deflate."
-        if not chunks else ""
+        if not synthesis else ""
     )
     previous_scores = [
         {
@@ -756,7 +787,7 @@ def _call_scoring(
     ]
     user_msg = _build_scoring_user_message(
         valid_question=valid_question,
-        context_str=context_str,
+        synthesis=synthesis,
         gate_result=gate_result,
         skip_bridging_bonus=skip_bridging_bonus,
         previous_scores=previous_scores,
@@ -901,25 +932,30 @@ def _build_scaffold_parameters(
     user_msg = (
         f"Topic the student just engaged with: {current_topic}\n"
         f"Scaffold strategy: {scaffold_strategy}\n"
-        f"Previous parameters to avoid repeating: {json.dumps(previous_parameters)}\n\n"
-        f"Generate the 2 abstract parameters as a JSON object."
+        f"Previous parameters to avoid repeating: {json.dumps(previous_parameters)}"
     )
-    try:
-        response = _openai.responses.create(
-            model=EVALUATOR_MODEL,
-            instructions=SCAFFOLD_PARAM_PROMPT,
-            input=user_msg,
-            text={"format": {"type": "json_object"}},
-        )
-        raw = _extract_response_text(response)
-        parsed = _parse_json_payload(raw)
-        params = parsed.get("parameters", [])
-        if isinstance(params, list) and len(params) == 2:
-            return params
-        log.warning("Scaffold param call returned unexpected shape: %s", parsed)
-    except Exception as exc:
-        log.error("Scaffold param call failed: %s", exc)
-    return ["threshold ratio", "response magnitude"]
+    for attempt in range(2):
+        try:
+            response = _openai.responses.create(
+                model=GATE_MODEL,
+                instructions=SCAFFOLD_PARAM_PROMPT,
+                input=user_msg,
+                text={"format": {"type": "json_object"}},
+                reasoning={"effort": "low"},
+            )
+            raw = _extract_response_text(response)
+            parsed = _parse_json_payload(raw)
+            params = parsed.get("parameters", [])
+            if isinstance(params, list) and len(params) == 2:
+                return params
+            log.warning("Scaffold param call returned unexpected shape (attempt %d): %s", attempt + 1, parsed)
+        except Exception as exc:
+            log.warning("Scaffold param call attempt %d failed: %s", attempt + 1, exc)
+    prev_set = set(previous_parameters)
+    for pair in _SCAFFOLD_FALLBACK_POOL:
+        if not any(p in prev_set for p in pair):
+            return pair
+    return _SCAFFOLD_FALLBACK_POOL[0]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -927,23 +963,18 @@ def _build_scaffold_parameters(
 # ─────────────────────────────────────────────────────────────
 def _call_feedback(
     question: str,
-    chunks: list[str],
+    synthesis: str,
     scoring_result: dict[str, Any],
     gate_result: dict[str, Any],
     session_state: dict[str, Any],
 ) -> dict[str, Any]:
     scores = scoring_result.get("scores", {})
     cot = scoring_result.get("chain_of_thought", {})
-    chunk_lines = "\n".join(
-        f"{i+1}. {_strip_chunk_metadata(c)}" for i, c in enumerate(chunks)
-    )
     user_msg = (
         f"student_question: {question}\n\n"
-        f"passage_chunks:\n{chunk_lines or '(none)'}\n\n"
+        f"passage:\n{synthesis or '(none)'}\n\n"
         f"routing_branch: {scoring_result.get('routing_branch', '')}\n"
-        f"gate_flag: {gate_result.get('flag', 'pass')}\n"
-        f"gate_premise: {json.dumps(gate_result.get('premise', ['valid']))}\n"
-        f"gate_stop_reason: {gate_result.get('stop_reason') or 'null'}\n\n"
+        f"gate_premise: {json.dumps(gate_result.get('premise', ['valid']))}\n\n"
         f"consecutive_low_score_count: {session_state.get('consecutive_low_score_count', 0)}\n"
         f"same_topic_streak: {session_state.get('same_topic_streak', 0)}\n"
         f"is_deepening: {str(session_state.get('is_deepening', False)).lower()}\n"
@@ -953,8 +984,7 @@ def _call_feedback(
         f"  minimum_answer: {cot.get('minimum_answer', '')}\n"
         f"  relevance_reasoning: {cot.get('relevance_reasoning', '')}\n"
         f"  bloom_reasoning: {cot.get('bloom_reasoning', '')}\n"
-        f"  depth_reasoning: {cot.get('depth_reasoning', '')}\n\n"
-        f"Return JSON: {{ \"verdict\": \"...\", \"coach_feedback\": \"...\", \"diagnosis\": \"...\" }}"
+        f"  depth_reasoning: {cot.get('depth_reasoning', '')}"
     )
     raw = ""
     for attempt in range(2):
@@ -981,31 +1011,27 @@ def _call_feedback(
 # ─────────────────────────────────────────────────────────────
 def _call_reframe(
     student_question: str,
-    chunks: list[str],
+    synthesis: str,
     scoring_result: dict[str, Any],
     gate_result: dict[str, Any],
 ) -> dict[str, Any]:
     cot    = scoring_result.get("chain_of_thought", {})
     scores = scoring_result.get("scores", {})
-    chunk_lines = "\n".join(
-        f"{i+1}. {_strip_chunk_metadata(c)}" for i, c in enumerate(chunks)
-    )
     anchor_list = gate_result.get("anchor_list") or []
     anchor_str  = (
         "\n".join(f"- {a}" for a in anchor_list)
         if anchor_list else "(none extracted)"
     )
     user_msg = (
-        f"passage_chunks:\n{chunk_lines or '(none)'}\n\n"
+        f"passage:\n{synthesis or '(none)'}\n\n"
         f"anchor_list (concepts the passage substantively covers):\n"
         f"{anchor_str}\n\n"
         f"minimum_answer: {cot.get('minimum_answer', '')}\n\n"
         f"current_topic: {scoring_result.get('current_topic', '')}\n"
         f"student_question: {student_question}\n\n"
+        f"routing_branch: {scoring_result.get('routing_branch', '')}\n"
         f"bloom_b: {int(scores.get('bloom_b', 0))}\n"
-        f"depth_d: {int(scores.get('depth_d', 0))}\n"
-        f"composite_score: {float(scores.get('composite_score', 0.0)):.2f}\n\n"
-        f"Generate the reframed question as a JSON object."
+        f"depth_d: {int(scores.get('depth_d', 0))}"
     )
     raw = ""
     for attempt in range(2):
@@ -1026,6 +1052,14 @@ def _call_reframe(
             student_must_decide = parsed.get("student_must_decide", "")
             if not isinstance(student_must_decide, str) or not student_must_decide.strip():
                 log.warning("Reframe call returned empty student_must_decide (attempt %d).", attempt + 1)
+                continue
+            bloom_target = parsed.get("bloom_target")
+            depth_target = parsed.get("depth_target")
+            if not isinstance(bloom_target, int) or bloom_target <= int(scores.get("bloom_b", 0)):
+                log.warning("Reframe call returned invalid bloom_target=%s (attempt %d).", bloom_target, attempt + 1)
+                continue
+            if not isinstance(depth_target, int) or depth_target <= int(scores.get("depth_d", 0)):
+                log.warning("Reframe call returned invalid depth_target=%s (attempt %d).", depth_target, attempt + 1)
                 continue
             return parsed
         except Exception as exc:
@@ -1095,242 +1129,8 @@ def build_fallback_response() -> dict[str, Any]:
 
 
 # ─────────────────────────────────────────────────────────────
-# Main orchestrator
-# ─────────────────────────────────────────────────────────────
-def call_evaluator(
-    student_question: str,
-    vector_store_id: str,
-    session_state: dict[str, Any],
-    skip_bridging_bonus: bool = False,
-) -> dict[str, Any]:
-    stripped_q = student_question.strip()
-    if len(stripped_q) < 8 or not any(c.isalpha() for c in stripped_q):
-        return {
-            "chain_of_thought": {"anchor_list": [], "required_answer_content": "", "bloom_reasoning": "", "depth_reasoning": "", "relevance_reasoning": "Question too short or contains no words.", "coherence_check": ""},
-            "current_topic": "Off-Topic",
-            "scores": {"relevance_r": 0.0, "bloom_b": 1, "depth_d": 1, "bridging_bonus": 0, "composite_score": 0.0},
-            "flags": [],
-            "verdictTone": "bad",
-            "feedback": "Try writing out your question in full — even a short one works as long as it connects to the material.",
-            "scaffold_assigned": {"strategy": "premise_correction", "parameters": []},
-            "verdict_flags": [{"label": "Vague", "tone": "warn"}],
-            "suppress_tier": False,
-        }
-
-    t_start = time.perf_counter()
-
-    retrieval_query = (
-        f"Find passages that explain the mechanisms, processes, concepts, tradeoffs "
-        f"or constraints directly relevant to answering this question: {student_question}"
-    )
-    chunks = retrieve_chunks(query=retrieval_query, vector_store_id=vector_store_id, max_results=7)
-    if not chunks:
-        log.warning("RETRIEVAL: 0 chunks for vector_store_id=%s", vector_store_id)
-
-    # Call 1: Gate
-    previous_questions = session_state.get("previous_questions", [])
-    gate_result = _call_gate(
-        question=student_question,
-        chunks=chunks,
-        previous_questions=previous_questions,
-    )
-    log.info(
-        "Gate flag=%s premise=%s stop_reason=%s",
-        gate_result.get("flag"),
-        gate_result.get("premise"),
-        gate_result.get("stop_reason"),
-    )
-
-    _gate_premise = (gate_result.get("premise") or [])
-    _premise_lead = _gate_premise[0] if _gate_premise else ""
-    stop_reason = gate_result.get("stop_reason")
-
-    # Hard stops — return directly
-    if _premise_lead == "off-topic" or stop_reason in ("off_topic", "question is off-topic"):
-        return {
-            "chain_of_thought": {"anchor_list": [], "required_answer_content": "", "bloom_reasoning": "", "depth_reasoning": "", "relevance_reasoning": "Fully off-topic.", "coherence_check": ""},
-            "current_topic": "Off-Topic",
-            "scores": {"relevance_r": 0.0, "bloom_b": 0, "depth_d": 0, "bridging_bonus": 0, "composite_score": 0.0},
-            "flags": ["off-topic"],
-            "verdictTone": "bad",
-            "verdict": "Off the material.",
-            "feedback": "This question falls outside the material being studied in this session. Try anchoring your next question to one of the concepts covered in the reading.",
-            "diagnosis": "The question doesn't reference anything from the passage being studied.",
-            "scaffold_assigned": {"strategy": "premise_correction", "parameters": []},
-            "verdict_flags": [{"label": "Off-Topic", "tone": "bad"}],
-            "suppress_tier": False,
-        }
-
-    if _premise_lead == "paste" or stop_reason in ("paste", "pasted content"):
-        return {
-            "chain_of_thought": {"anchor_list": [], "required_answer_content": "", "bloom_reasoning": "", "depth_reasoning": "", "relevance_reasoning": "Pasted passage, not a question.", "coherence_check": ""},
-            "current_topic": "Off-Topic",
-            "scores": {"relevance_r": 0.0, "bloom_b": 0, "depth_d": 0, "bridging_bonus": 0, "composite_score": 0.0},
-            "flags": ["vague"],
-            "verdictTone": "bad",
-            "verdict": "Not a question.",
-            "feedback": "What was submitted isn't a question — it looks like a passage from the material. Try forming a question about something in it that you found interesting or unclear.",
-            "diagnosis": "This submission is prose, not a question — it can't be scored.",
-            "scaffold_assigned": {"strategy": "premise_correction", "parameters": []},
-            "verdict_flags": [{"label": "Vague", "tone": "warn"}],
-            "suppress_tier": False,
-        }
-
-    if _premise_lead == "resubmission" or stop_reason == "resubmission":
-        return {
-            "chain_of_thought": {"anchor_list": [], "required_answer_content": "", "bloom_reasoning": "", "depth_reasoning": "", "relevance_reasoning": "Near-identical resubmission.", "coherence_check": ""},
-            "current_topic": session_state.get("current_topic", "General Topic"),
-            "scores": {"relevance_r": 0.0, "bloom_b": 0, "depth_d": 0, "bridging_bonus": 0, "composite_score": 0.0},
-            "flags": [],
-            "verdictTone": "warn",
-            "verdict": "Already asked this.",
-            "feedback": "This question closely mirrors one you already asked — try building on it by asking what changes under a different condition, or connecting it to something else in the material.",
-            "diagnosis": "This submission covers the same concept and cognitive act as a prior question this session.",
-            "scaffold_assigned": {"strategy": "premise_correction", "parameters": []},
-            "verdict_flags": [{"label": "Resubmission", "tone": "warn"}],
-            "suppress_tier": False,
-        }
-
-    if _premise_lead == "gamification" or stop_reason in ("injection_no_fragment", "gamifying question"):
-        return {
-            "chain_of_thought": {"anchor_list": [], "required_answer_content": "", "bloom_reasoning": "", "depth_reasoning": "", "relevance_reasoning": "Injection attempt, no valid fragment.", "coherence_check": ""},
-            "current_topic": "Off-Topic",
-            "scores": {"relevance_r": 0.0, "bloom_b": 0, "depth_d": 0, "bridging_bonus": 0, "composite_score": 0.0},
-            "flags": ["off-topic"],
-            "verdictTone": "bad",
-            "verdict": "Off the material.",
-            "feedback": "Your question needs to stay focused on the session material — try submitting a genuine question about one of the concepts in the reading.",
-            "diagnosis": "The submission contained instruction-like content and no salvageable academic question.",
-            "scaffold_assigned": {"strategy": "premise_correction", "parameters": []},
-            "verdict_flags": [{"label": "Off-Topic", "tone": "bad"}],
-            "suppress_tier": False,
-        }
-
-    if _premise_lead == "vague" or stop_reason == "vague question":
-        return {
-            "chain_of_thought": {"anchor_list": [], "required_answer_content": "", "bloom_reasoning": "", "depth_reasoning": "", "relevance_reasoning": "Question lacks a specific anchor.", "coherence_check": ""},
-            "current_topic": session_state.get("current_topic", "General Topic"),
-            "scores": {"relevance_r": 0.0, "bloom_b": 0, "depth_d": 1, "bridging_bonus": 0, "composite_score": 0.0},
-            "flags": ["vague"],
-            "verdictTone": "warn",
-            "verdict": "Too vague.",
-            "feedback": "Your question doesn't name a specific concept, mechanism, or term — try anchoring it to something you read in the material.",
-            "diagnosis": "The question could apply to any domain and doesn't reference anything specific enough to evaluate against the passage.",
-            "scaffold_assigned": {"strategy": "premise_correction", "parameters": []},
-            "verdict_flags": [{"label": "Vague", "tone": "warn"}],
-            "suppress_tier": False,
-        }
-
-    valid_question = gate_result.get("valid_question") or student_question
-
-    # Call 2: Scoring + post-processing
-    scoring_result = _call_scoring(
-        valid_question=valid_question,
-        chunks=chunks,
-        session_state=session_state,
-        gate_result=gate_result,
-        skip_bridging_bonus=skip_bridging_bonus,
-    )
-    if scoring_result is None:
-        return build_fallback_response()
-
-    try:
-        scoring_result = post_process_scoring(
-            scoring_result=scoring_result,
-            session_state=session_state,
-            gate_result=gate_result,
-            skip_bridging_bonus=skip_bridging_bonus,
-        )
-    except ValueError as exc:
-        log.error("post_process_scoring failed: %s", exc)
-        return build_fallback_response()
-
-    if scoring_result["routing_branch"] == "C-STEER":
-        prev_params = session_state.get("previous_scaffold", {}).get("parameters", [])
-        scaffold_params = _build_scaffold_parameters(
-            current_topic=scoring_result.get("current_topic", ""),
-            scaffold_strategy=scoring_result["scaffold_strategy"],
-            previous_parameters=prev_params,
-        )
-        scoring_result["scaffold_parameters"] = scaffold_params
-    else:
-        scoring_result["scaffold_parameters"] = []
-
-    scores = scoring_result["scores"]
-
-    # Calls 3 + 4: Feedback & Reframe — run concurrently in threads
-    def _run_feedback():
-        return _call_feedback(
-            question=valid_question,
-            chunks=chunks,
-            scoring_result=scoring_result,
-            gate_result=gate_result,
-            session_state=session_state,
-        )
-
-    def _run_reframe():
-        if scoring_result.get("routing_branch") == "B":
-            log.info("Reframe suppressed (Branch B)")
-            return _REFRAME_FALLBACK.copy()
-        return _call_reframe(
-            student_question=valid_question,
-            chunks=chunks,
-            scoring_result=scoring_result,
-            gate_result=gate_result,
-        )
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        f_future = executor.submit(_run_feedback)
-        r_future = executor.submit(_run_reframe)
-        feedback_result = f_future.result()
-        reframe_result  = r_future.result()
-
-    coach_feedback = (
-        feedback_result.get("coach_feedback")
-        or feedback_result.get("feedback")
-        or "Good thinking — keep engaging with the material."
-    )
-    verdict_label  = feedback_result.get("verdict") or ""
-    diagnosis_text = feedback_result.get("diagnosis") or ""
-
-    scaffold_strategy = scoring_result["scaffold_strategy"]
-    scaffold_params   = scoring_result["scaffold_parameters"]
-
-    reframed_question: str | None = reframe_result.get("reframed_question") or None
-    student_must_decide: str | None = reframe_result.get("student_must_decide") or None
-
-    log.info(
-        "call_evaluator done | branch=%s composite=%.2f reframed=%s elapsed=%.3fs",
-        scoring_result.get("routing_branch", "?"),
-        float(scores.get("composite_score", 0)),
-        "yes" if reframed_question else "no",
-        time.perf_counter() - t_start,
-    )
-
-    return {
-        "chain_of_thought": scoring_result.get("chain_of_thought", {}),
-        "current_topic": scoring_result.get("current_topic", "General Topic"),
-        "topics": scoring_result.get("topics", []),
-        "scores": scores,
-        "verdictTone": scoring_result["verdictTone"],
-        "feedback": coach_feedback,
-        "verdict": verdict_label,
-        "diagnosis": diagnosis_text,
-        "scaffold_assigned": {
-            "strategy": scaffold_strategy,
-            "parameters": scaffold_params,
-        },
-        "verdict_flags": [],
-        "suppress_tier": scoring_result["suppress_tier"],
-        "reframed_question": reframed_question,
-        "student_must_decide": student_must_decide,
-    }
-
-
-# ─────────────────────────────────────────────────────────────
-# Streaming orchestrator — SSE generator version of call_evaluator
-# Yields at two checkpoints so the client gets scores immediately,
-# then coaching once feedback + reframe finish concurrently.
+# Streaming orchestrator — yields scores immediately, then
+# coaching once feedback + reframe finish concurrently.
 # ─────────────────────────────────────────────────────────────
 def call_evaluator_streaming(
     student_question: str,
@@ -1359,13 +1159,14 @@ def call_evaluator_streaming(
 
     t_start = time.perf_counter()
 
-    retrieval_query = (
-        f"Find passages that explain the mechanisms, processes, concepts, tradeoffs "
-        f"or constraints directly relevant to answering this question: {student_question}"
-    )
     t0 = time.perf_counter()
-    chunks = retrieve_chunks(query=retrieval_query, vector_store_id=vector_store_id, max_results=7)
-    log.info("TIMING | retrieval=%.3fs chunks=%d", time.perf_counter() - t0, len(chunks))
+    retrieval  = retrieve_chunks(query=student_question, vector_store_id=vector_store_id, max_results=7)
+    chunks     = retrieval["chunks"]
+    synthesis  = retrieval["synthesis"]
+    log.info(
+        "TIMING | retrieval=%.3fs chunks=%d synthesis_len=%d",
+        time.perf_counter() - t0, len(chunks), len(synthesis),
+    )
     if not chunks:
         log.warning("RETRIEVAL: 0 chunks for vector_store_id=%s", vector_store_id)
 
@@ -1374,6 +1175,7 @@ def call_evaluator_streaming(
     gate_result = _call_gate(
         question=student_question,
         chunks=chunks,
+        synthesis=synthesis,
         previous_questions=previous_questions,
     )
     log.info(
@@ -1456,7 +1258,7 @@ def call_evaluator_streaming(
     t0 = time.perf_counter()
     scoring_result = _call_scoring(
         valid_question=valid_question,
-        chunks=chunks,
+        synthesis=synthesis,
         session_state=session_state,
         gate_result=gate_result,
         skip_bridging_bonus=skip_bridging_bonus,
@@ -1515,7 +1317,7 @@ def call_evaluator_streaming(
         t_fb = time.perf_counter()
         result = _call_feedback(
             question=valid_question,
-            chunks=chunks,
+            synthesis=synthesis,
             scoring_result=scoring_result,
             gate_result=gate_result,
             session_state=session_state,
@@ -1530,7 +1332,7 @@ def call_evaluator_streaming(
         t_rf = time.perf_counter()
         result = _call_reframe(
             student_question=valid_question,
-            chunks=chunks,
+            synthesis=synthesis,
             scoring_result=scoring_result,
             gate_result=gate_result,
         )
