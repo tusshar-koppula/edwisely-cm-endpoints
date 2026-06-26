@@ -18,7 +18,7 @@ from database import Session as _db_Session
 
 log = logging.getLogger(__name__)
 
-_SIMILARITY_MIN    = 0.50   # discard candidates below this cosine score
+_SIMILARITY_MIN    = 0.60   # discard candidates below this cosine score
 _EMBED_BUILD_CHUNK = 500    # rows per DB fetch when building .npz at assessment end
 
 _s3 = boto3.client(
