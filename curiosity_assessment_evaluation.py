@@ -19,11 +19,11 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────
 # Model assignments
 # ─────────────────────────────────────────────────────────────
-RETRIEVAL_MODEL = "gpt-4.1-nano"
-GATE_MODEL      = "gpt-5.4-nano"
+RETRIEVAL_MODEL = "gpt-5.4-nano"
+GATE_MODEL      = "gpt-5.4-mini"
 EVALUATOR_MODEL = "gpt-5.4-mini"
-FEEDBACK_MODEL  = "gpt-5-mini"
-REFRAME_MODEL   = "gpt-5-mini"
+FEEDBACK_MODEL  = "gpt-5.4-nano"
+REFRAME_MODEL   = "gpt-5.4-nano"
 
 # ─────────────────────────────────────────────────────────────
 # Utility helpers
@@ -405,6 +405,23 @@ Use IDs only (e.g. "T1", "T3") — never free text.
 
 ---
 
+## Step 8 — Scaffold parameters
+
+Read `Scaffold strategy:` from the user message.
+
+If the strategy is `null`, `None`, `encouragement`, or `yield` — set `scaffold_parameters` to `[]`.
+
+If the strategy is `bridging_scaffolding` or `constraint_scaffolding`:
+- Generate exactly 2 abstract scaffold parameters grounded in the `current_topic` you determined in Step 7.
+- Use only abstract quantities: rates, gradients, resistances, potentials, ratios, thresholds, durations, magnitudes, frequencies, densities.
+- Never name objects, organisms, locations, chemicals, devices, or processes.
+- Each parameter must be a short noun phrase (2–5 words).
+- bridging_scaffolding: draw the two parameters from two distinct abstract domains so the student must find a connection between them.
+- constraint_scaffolding: make both parameters act as limiting boundary conditions on a system or process.
+- Do not repeat any parameter listed in `Previous scaffold parameters:` from the user message.
+
+---
+
 ## Output
 
 ```json
@@ -423,7 +440,8 @@ Use IDs only (e.g. "T1", "T3") — never free text.
     "bloom_b": <integer 1–6>,
     "depth_d": <integer 1–4>,
     "bridging_bonus": <0 or 1>
-  }
+  },
+  "scaffold_parameters": ["<param 1>", "<param 2>"]
 }
 ```
 """.strip()
@@ -574,29 +592,6 @@ Return only this JSON object. After the closing `}`, output nothing further.
   "anchor_concepts_used": ["<concept1>", "<concept2>", ...]
 }""".strip()
 
-SCAFFOLD_PARAM_PROMPT = """
-Generate exactly 2 abstract scaffold parameters for a student learning exercise.
-
-Rules:
-- Use only abstract quantities: rates, gradients, resistances, potentials,
-  ratios, thresholds, durations, magnitudes, frequencies, densities.
-- Never name objects, organisms, locations, chemicals, devices, or processes.
-- Each parameter must be a short noun phrase (2-5 words).
-- Do not repeat any parameter from the previous list.
-
-Scaffold strategy guidance:
-- bridging_scaffolding: generate parameters drawn from two distinct abstract domains — the student must find a way to connect them.
-- constraint_scaffolding: generate parameters that act as limiting boundary conditions on a system or process.
-
-Return only this JSON: { "parameters": ["<param 1>", "<param 2>"] }
-""".strip()
-
-_SCAFFOLD_FALLBACK_POOL = [
-    ["input rate",         "output threshold"],
-    ["variance magnitude", "critical ratio"],
-    ["transition period",  "boundary gradient"],
-    ["peak density",       "response duration"],
-]
 
 # ─────────────────────────────────────────────────────────────
 # Fallback constants
@@ -699,7 +694,7 @@ def _call_gate(
             response = _openai.responses.create(
                 model=GATE_MODEL,
                 instructions=GATE_SYSTEM_PROMPT,
-                input=user_msg,
+                input=user_msg + "\n\nRespond with a JSON object.",
                 reasoning={"effort": "medium"},
                 text={"format": {"type": "json_object"}},
             )
@@ -730,6 +725,8 @@ def _build_scoring_user_message(
     previous_scores: list[dict],
     no_context_notice: str,
     topic_map: list[dict] | None = None,
+    scaffold_strategy: str | None = None,
+    previous_scaffold_parameters: list[str] | None = None,
 ) -> str:
     previous_scores_str = json.dumps(previous_scores) if previous_scores else "None"
     anchor_list_str = json.dumps(gate_result.get("anchor_list") or [])
@@ -742,6 +739,8 @@ def _build_scoring_user_message(
         f"Passage links (concept pairs the passage already explicitly connects): {passage_links_str}",
         f"Skip bridging bonus: {str(skip_bridging_bonus).lower()}",
         f"Topic map (id -> label):\n{topic_map_str}",
+        f"Scaffold strategy: {scaffold_strategy}",
+        f"Previous scaffold parameters: {json.dumps(previous_scaffold_parameters or [])}",
         "",
         "Passage:",
         synthesis or "(none)",
@@ -767,6 +766,8 @@ def _call_scoring(
     session_state: dict[str, Any],
     gate_result: dict[str, Any],
     skip_bridging_bonus: bool,
+    scaffold_strategy: str | None = None,
+    previous_scaffold_parameters: list[str] | None = None,
 ) -> dict[str, Any] | None:
     no_context_notice = (
         "NOTE: The retrieval system returned no passage. "
@@ -793,6 +794,8 @@ def _call_scoring(
         previous_scores=previous_scores,
         no_context_notice=no_context_notice,
         topic_map=session_state.get("topic_map") or [],
+        scaffold_strategy=scaffold_strategy,
+        previous_scaffold_parameters=previous_scaffold_parameters,
     )
     raw = ""
     for attempt in range(2):
@@ -800,9 +803,9 @@ def _call_scoring(
             response = _openai.responses.create(
                 model=EVALUATOR_MODEL,
                 instructions=SCORING_SYSTEM_PROMPT,
-                input=user_msg,
+                input=user_msg + "\n\nRespond with a JSON object.",
                 text={"format": {"type": "json_object"}},
-                reasoning={"effort": "low"},
+                reasoning={"effort": "medium"},
             )
             raw = _extract_response_text(response)
             parsed = _parse_json_payload(raw)
@@ -921,41 +924,6 @@ def post_process_scoring(
     }
 
 
-# ─────────────────────────────────────────────────────────────
-# _build_scaffold_parameters — only for C-STEER branch
-# ─────────────────────────────────────────────────────────────
-def _build_scaffold_parameters(
-    current_topic: str,
-    scaffold_strategy: str,
-    previous_parameters: list[str],
-) -> list[str]:
-    user_msg = (
-        f"Topic the student just engaged with: {current_topic}\n"
-        f"Scaffold strategy: {scaffold_strategy}\n"
-        f"Previous parameters to avoid repeating: {json.dumps(previous_parameters)}"
-    )
-    for attempt in range(2):
-        try:
-            response = _openai.responses.create(
-                model=GATE_MODEL,
-                instructions=SCAFFOLD_PARAM_PROMPT,
-                input=user_msg,
-                text={"format": {"type": "json_object"}},
-                reasoning={"effort": "low"},
-            )
-            raw = _extract_response_text(response)
-            parsed = _parse_json_payload(raw)
-            params = parsed.get("parameters", [])
-            if isinstance(params, list) and len(params) == 2:
-                return params
-            log.warning("Scaffold param call returned unexpected shape (attempt %d): %s", attempt + 1, parsed)
-        except Exception as exc:
-            log.warning("Scaffold param call attempt %d failed: %s", attempt + 1, exc)
-    prev_set = set(previous_parameters)
-    for pair in _SCAFFOLD_FALLBACK_POOL:
-        if not any(p in prev_set for p in pair):
-            return pair
-    return _SCAFFOLD_FALLBACK_POOL[0]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -992,7 +960,7 @@ def _call_feedback(
             response = _openai.responses.create(
                 model=FEEDBACK_MODEL,
                 instructions=FEEDBACK_SYSTEM_PROMPT,
-                input=user_msg,
+                input=user_msg + "\n\nRespond with a JSON object.",
                 text={"format": {"type": "json_object"}},
                 reasoning={"effort": "low"},
             )
@@ -1039,7 +1007,7 @@ def _call_reframe(
             response = _openai.responses.create(
                 model=REFRAME_MODEL,
                 instructions=REFRAME_SYSTEM_PROMPT,
-                input=user_msg,
+                input=user_msg + "\n\nRespond with a JSON object.",
                 text={"format": {"type": "json_object"}},
                 reasoning={"effort": "medium"},
             )
@@ -1254,6 +1222,20 @@ def call_evaluator_streaming(
 
     valid_question = gate_result.get("valid_question") or student_question
 
+    # Determine anticipated scaffold strategy from session state before scoring.
+    # C-STEER routing depends only on session counters (not on scores), so this
+    # can be computed now and passed to the evaluator to generate params in one call.
+    _consec_low    = int(session_state.get("consecutive_low_score_count", 0))
+    _streak        = int(session_state.get("same_topic_streak", 0))
+    _deepening     = bool(session_state.get("is_deepening", False))
+    if _streak >= 2 and not _deepening:
+        anticipated_scaffold_strategy = "bridging_scaffolding"
+    elif _consec_low >= 3:
+        anticipated_scaffold_strategy = "constraint_scaffolding"
+    else:
+        anticipated_scaffold_strategy = None
+    prev_scaffold_params = session_state.get("previous_scaffold", {}).get("parameters", [])
+
     # Call 2: Scoring + post-processing
     t0 = time.perf_counter()
     scoring_result = _call_scoring(
@@ -1262,6 +1244,8 @@ def call_evaluator_streaming(
         session_state=session_state,
         gate_result=gate_result,
         skip_bridging_bonus=skip_bridging_bonus,
+        scaffold_strategy=anticipated_scaffold_strategy,
+        previous_scaffold_parameters=prev_scaffold_params,
     )
     log.info("TIMING | evaluator=%.3fs", time.perf_counter() - t0)
     if scoring_result is None:
@@ -1287,8 +1271,6 @@ def call_evaluator_streaming(
     scores = scoring_result["scores"]
 
     # ── Yield 1: scores ready — client can render verdict bar immediately ──
-    # Scaffold parameters are NOT included here — they're only needed by the
-    # feedback call. Building them after this yield avoids blocking the client.
     yield {
         "stage":           "scores",
         "scores":          scores,
@@ -1300,16 +1282,9 @@ def call_evaluator_streaming(
         "chain_of_thought": scoring_result.get("chain_of_thought", {}),
     }
 
-    # Build scaffold parameters after yielding scores — this LLM call only
-    # runs for C-STEER and is needed by feedback, not by the scores chunk
-    if scoring_result["routing_branch"] == "C-STEER":
-        prev_params = session_state.get("previous_scaffold", {}).get("parameters", [])
-        scoring_result["scaffold_parameters"] = _build_scaffold_parameters(
-            current_topic=scoring_result.get("current_topic", ""),
-            scaffold_strategy=scoring_result["scaffold_strategy"],
-            previous_parameters=prev_params,
-        )
-    else:
+    # Scaffold parameters were generated by the evaluator in the same call.
+    # Fall back to empty list if the model omitted the field.
+    if not isinstance(scoring_result.get("scaffold_parameters"), list):
         scoring_result["scaffold_parameters"] = []
 
     # Calls 3 + 4: Feedback & Reframe — concurrent threads

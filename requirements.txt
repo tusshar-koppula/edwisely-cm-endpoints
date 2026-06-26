@@ -8,3 +8,4 @@ boto3
 pypdf
 redis
 openai>=1.14.0
+numpy

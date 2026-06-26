@@ -1,6 +1,6 @@
 from sqlalchemy import (
     Table, Column, Integer, String, MetaData, Text, DateTime,
-    SmallInteger, DECIMAL, TIMESTAMP, Enum, ForeignKey, JSON
+    SmallInteger, DECIMAL, TIMESTAMP, Enum, ForeignKey, JSON, LargeBinary
 )
 
 metadata = MetaData()
@@ -114,6 +114,7 @@ curiosity_assessment = Table('curiosity_assessment', metadata,
     Column('doc_s3_key', String(512), nullable=True),
     Column('doc_storage_url', Text, nullable=True),
     Column('vector_store_id', String(100), nullable=True),
+    Column('vs_status', Enum('pending', 'ready', 'failed'), nullable=True),
     Column('doc_pages', SmallInteger, nullable=True),
     Column('doc_size_bytes', Integer, nullable=True),
     Column('rubric_relevance_limit', SmallInteger, nullable=False, default=4),
@@ -130,7 +131,8 @@ curiosity_assessment = Table('curiosity_assessment', metadata,
     Column('updated_at', DateTime, nullable=False),
     Column('median_time_seconds', Integer, nullable=True),
     Column('is_deleted', SmallInteger, nullable=False, default=0),
-    Column('score_distribution', JSON, nullable=True)
+    Column('score_distribution', JSON, nullable=True),
+    Column('embedding_s3_key', String(512), nullable=True)
 )
 
 ca_has_topics = Table('ca_has_topics', metadata,
@@ -154,7 +156,10 @@ ca_has_students = Table('ca_has_students', metadata,
     Column('started_at', DateTime, nullable=True),
     Column('submitted_at', DateTime, nullable=True),
     Column('time_elapsed_seconds', Integer, nullable=True),
-    Column('added_at', DateTime, nullable=True)
+    Column('added_at', DateTime, nullable=True),
+    Column('faculty_feedback', Text, nullable=True),
+    Column('feedback_sent_by', Integer, nullable=True),
+    Column('feedback_sent_at', DateTime, nullable=True)
 )
 
 ca_question_submissions = Table('ca_question_submissions', metadata,
@@ -171,16 +176,8 @@ ca_question_submissions = Table('ca_question_submissions', metadata,
     Column('ai_feedback', Text, nullable=True),
     Column('question_reframe', Text, nullable=True),
     Column('nudge', Text, nullable=True),
-    Column('submitted_at', DateTime, nullable=False)
-)
-
-ca_faculty_feedback = Table('ca_faculty_feedback', metadata,
-    Column('feedback_id', Integer, primary_key=True, autoincrement=True),
-    Column('ca_id', Integer, ForeignKey('curiosity_assessment.assmt_id', ondelete='CASCADE'), nullable=False),
-    Column('student_id', Integer, nullable=False),
-    Column('sent_by', Integer, nullable=False),
-    Column('message', Text, nullable=False),
-    Column('sent_at', DateTime, nullable=False)
+    Column('submitted_at', DateTime, nullable=False),
+    Column('embedding', LargeBinary(6144), nullable=True)
 )
 
 ca_share = Table('ca_share', metadata,
@@ -196,5 +193,6 @@ ca_share = Table('ca_share', metadata,
 ca_similar_questions = Table('ca_similar_questions', metadata,
     Column('id', Integer, primary_key=True, autoincrement=True),
     Column('source_q_id', Integer, nullable=False),
-    Column('question', Text, nullable=False)
+    Column('similar_q_id', Integer, nullable=False),
+    Column('similarity_score', DECIMAL(5, 4), nullable=False)
 )

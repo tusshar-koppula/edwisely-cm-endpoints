@@ -56,4 +56,8 @@ sampleCodeForQuery.py
 supporting_tables.sql
 Complete_Schemas_List.sql
 sample_data.sql
+supporting_tables.txt
+test_key_output.txt
+supporting_metadata.py
+ca_migration.sql
 testing_guide.txt

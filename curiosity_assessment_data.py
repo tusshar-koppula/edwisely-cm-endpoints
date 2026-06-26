@@ -4,7 +4,9 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import logging
+import numpy as np
 import os
+import pickle
 import time
 import uuid
 import io
@@ -12,12 +14,12 @@ import threading
 import boto3
 from pypdf import PdfReader
 from openai import OpenAI
-from redis_client import redis_client
+from database import Session as _db_Session
 
 log = logging.getLogger(__name__)
 
-_VS_READY_TTL  = 86400   # 24 h — matches practical vector store lifetime
-_VS_FAILED_TTL = 3600    # 1 h  — allow retry after transient failure
+_SIMILARITY_MIN    = 0.50   # discard candidates below this cosine score
+_EMBED_BUILD_CHUNK = 500    # rows per DB fetch when building .npz at assessment end
 
 _s3 = boto3.client(
     's3',
@@ -1076,6 +1078,7 @@ def getStudents(user_id, db, metadata, role, section_id=None, q=None):
 
 def _ingest_to_vector_store(vector_store_id, file_bytes, filename):
     t0 = time.perf_counter()
+    new_status = 'failed'
     try:
         # upload_and_poll uploads the file, attaches it to the vector store, and
         # blocks until OpenAI signals status='completed' or 'failed' — no manual
@@ -1090,17 +1093,28 @@ def _ingest_to_vector_store(vector_store_id, file_bytes, filename):
                 "TIMING | vector_store_indexing=%.3fs status=completed file_counts=%s",
                 elapsed, batch.file_counts,
             )
-            redis_client.set("ca_vs_ready:{}".format(vector_store_id), "1", ex=_VS_READY_TTL)
+            new_status = 'ready'
         else:
             log.error(
                 "TIMING | vector_store_indexing=%.3fs status=%s file_counts=%s",
                 elapsed, batch.status, batch.file_counts,
             )
-            redis_client.set("ca_vs_ready:{}".format(vector_store_id), "failed", ex=_VS_FAILED_TTL)
     except Exception as e:
         elapsed = time.perf_counter() - t0
         log.error("TIMING | vector_store_indexing=%.3fs EXCEPTION: %s", elapsed, e)
-        redis_client.set("ca_vs_ready:{}".format(vector_store_id), "failed", ex=_VS_FAILED_TTL)
+    finally:
+        db = _db_Session()
+        try:
+            db.execute(
+                text("UPDATE curiosity_assessment SET vs_status = :s WHERE vector_store_id = :v"),
+                {'s': new_status, 'v': vector_store_id}
+            )
+            db.commit()
+        except Exception as db_err:
+            log.error("vs_status update failed for vector_store_id=%s: %s", vector_store_id, db_err)
+            db.rollback()
+        finally:
+            _db_Session.remove()
 
 
 def uploadDocument(user_id, db, metadata, file, assmt_id=None):
@@ -2028,7 +2042,6 @@ def getAssessmentStats(user_id, db, metadata, assmt_id, sort=None):
 def getStudentQuestions(user_id, db, metadata, assmt_id, student_id):
     curiosity_assessment    = metadata.tables['curiosity_assessment']
     ca_question_submissions = metadata.tables['ca_question_submissions']
-    ca_faculty_feedback     = metadata.tables['ca_faculty_feedback']
     ca_has_students         = metadata.tables['ca_has_students']
 
     assmt = db.execute(
@@ -2062,13 +2075,15 @@ def getStudentQuestions(user_id, db, metadata, assmt_id, student_id):
         .order_by(ca_question_submissions.c.question_number)
     ).mappings().all()
 
-    # Fetch student's aggregate scores for this assessment
+    # Fetch student's aggregate scores and faculty feedback in one query
     student_row = db.execute(
         select(
             ca_has_students.c.avg_composite_score,
             ca_has_students.c.avg_r_score,
             ca_has_students.c.avg_b_score,
             ca_has_students.c.avg_d_score,
+            ca_has_students.c.faculty_feedback,
+            ca_has_students.c.feedback_sent_at,
         )
         .where(
             and_(
@@ -2077,22 +2092,6 @@ def getStudentQuestions(user_id, db, metadata, assmt_id, student_id):
             )
         )
     ).mappings().first()
-
-    # Fetch any faculty feedback for this student in this assessment
-    feedback_rows = db.execute(
-        select(
-            ca_faculty_feedback.c.feedback_id,
-            ca_faculty_feedback.c.message,
-            ca_faculty_feedback.c.sent_at
-        )
-        .where(
-            and_(
-                ca_faculty_feedback.c.ca_id == assmt_id,
-                ca_faculty_feedback.c.student_id == student_id
-            )
-        )
-        .order_by(ca_faculty_feedback.c.sent_at)
-    ).mappings().all()
 
     questions = []
     for row in q_rows:
@@ -2109,14 +2108,10 @@ def getStudentQuestions(user_id, db, metadata, assmt_id, student_id):
             ('submitted_at',     row['submitted_at'].isoformat())
         ]))
 
-    feedback = [
-        OrderedDict([
-            ('feedback_id', row['feedback_id']),
-            ('message',     row['message']),
-            ('sent_at',     row['sent_at'].isoformat())
-        ])
-        for row in feedback_rows
-    ]
+    feedback = OrderedDict([
+        ('message', student_row['faculty_feedback']),
+        ('sent_at', student_row['feedback_sent_at'].isoformat())
+    ]) if student_row and student_row['faculty_feedback'] else None
 
     questions_submitted = len(questions)
     top_score = max(
@@ -2276,7 +2271,7 @@ def getAssessmentSyllabus(user_id, db, metadata, assmt_id):
 
 def sendStudentFeedback(user_id, db, metadata, assmt_id, student_id, message_text):
     curiosity_assessment = metadata.tables['curiosity_assessment']
-    ca_faculty_feedback  = metadata.tables['ca_faculty_feedback']
+    ca_has_students      = metadata.tables['ca_has_students']
 
     assmt = db.execute(
         select(curiosity_assessment.c.assmt_id, curiosity_assessment.c.created_by)
@@ -2287,20 +2282,24 @@ def sendStudentFeedback(user_id, db, metadata, assmt_id, student_id, message_tex
         return None
 
     sent_at = _utcnow()
-    result = db.execute(
-        ca_faculty_feedback.insert().values(
-            ca_id      = assmt_id,
-            student_id = student_id,
-            sent_by    = user_id,
-            message    = message_text,
-            sent_at    = sent_at
+    db.execute(
+        update(ca_has_students)
+        .where(and_(
+            ca_has_students.c.ca_id      == assmt_id,
+            ca_has_students.c.student_id == student_id
+        ))
+        .values(
+            faculty_feedback = message_text,
+            feedback_sent_by = user_id,
+            feedback_sent_at = sent_at
         )
     )
     db.commit()
 
     return OrderedDict([
-        ('feedback_id', result.lastrowid),
-        ('sent_at',     sent_at.isoformat())
+        ('feedback', message_text),
+        ('sent_by', user_id),
+        ('sent_at', sent_at.isoformat())
     ])
 
 
@@ -2389,6 +2388,14 @@ def endAssessment(user_id, db, metadata, assmt_id):
     )
     db.commit()
 
+    # Build .npz from BLOB embeddings and upload to S3 in background — uses its
+    # own DB session so this thread returns immediately without blocking the response.
+    threading.Thread(
+        target=_build_and_upload_embeddings,
+        args=(assmt_id, metadata),
+        daemon=True,
+    ).start()
+
     return {'assmt_id': assmt_id, 'status': 'ended'}
 
 
@@ -2417,31 +2424,241 @@ def getAssessmentScorebands(user_id, db, metadata, assmt_id):
     return dist if not isinstance(dist, str) else json.loads(dist)
 
 
-def getSimilarQuestions(db, metadata, q_id):
-    ca_question_submissions = metadata.tables['ca_question_submissions']
-    ca_similar_questions    = metadata.tables['ca_similar_questions']
+def _build_and_upload_embeddings(assmt_id, metadata):
+    """Background job: batch-fetch embeddings from DB, build compressed .npz, upload to S3.
 
-    # Single query: LEFT JOIN validates q_id existence and fetches similar questions together.
-    # 0 rows  → q_id not in ca_question_submissions → caller returns 404.
-    # 1 row with question=None → q_id valid, no similar questions seeded yet → [].
-    # N rows  → return question texts.
+    Creates its own DB session so it can run in a daemon thread after the request
+    session is closed. Chunks reads to avoid loading all BLOB rows at once.
+    """
+    db = _db_Session()
+    try:
+        ca_question_submissions = metadata.tables['ca_question_submissions']
+        curiosity_assessment    = metadata.tables['curiosity_assessment']
+
+        q_id_list, student_id_list, emb_list = [], [], []
+        offset = 0
+
+        while True:
+            chunk = db.execute(
+                select(
+                    ca_question_submissions.c.q_id,
+                    ca_question_submissions.c.student_id,
+                    ca_question_submissions.c.embedding,
+                )
+                .where(and_(
+                    ca_question_submissions.c.ca_id       == assmt_id,
+                    ca_question_submissions.c.embedding.isnot(None),
+                ))
+                .order_by(ca_question_submissions.c.q_id)
+                .limit(_EMBED_BUILD_CHUNK)
+                .offset(offset)
+            ).mappings().all()
+
+            if not chunk:
+                break
+
+            for row in chunk:
+                q_id_list.append(row['q_id'])
+                student_id_list.append(row['student_id'])
+                emb_list.append(np.frombuffer(bytes(row['embedding']), dtype=np.float32))
+
+            offset += len(chunk)
+            if len(chunk) < _EMBED_BUILD_CHUNK:
+                break
+
+        if not q_id_list:
+            log.warning("_build_and_upload_embeddings: no embeddings found for ca_id=%s", assmt_id)
+            return
+
+        embeddings_arr = np.vstack(emb_list)  # (N, 1536)
+        buf = io.BytesIO()
+        np.savez_compressed(
+            buf,
+            q_ids       = np.array(q_id_list,      dtype=np.int32),
+            student_ids = np.array(student_id_list, dtype=np.int32),
+            embeddings  = embeddings_arr,
+        )
+
+        s3_key = 'ca_embeddings/{}.npz'.format(assmt_id)
+        _s3.put_object(Bucket=_S3_BUCKET, Key=s3_key, Body=buf.getvalue(), ContentType='application/octet-stream')
+
+        db.execute(
+            update(curiosity_assessment)
+            .where(curiosity_assessment.c.assmt_id == assmt_id)
+            .values(embedding_s3_key=s3_key)
+        )
+        db.commit()
+        log.info("_build_and_upload_embeddings: uploaded %d embeddings for ca_id=%s", len(q_id_list), assmt_id)
+    except Exception as e:
+        db.rollback()
+        log.error("_build_and_upload_embeddings failed for ca_id=%s: %s", assmt_id, e)
+    finally:
+        _db_Session.remove()
+
+
+def _load_assessment_npz(s3_key):
+    """Download .npz from S3, return (q_ids, student_ids, embeddings matrix)."""
+    obj = _s3.get_object(Bucket=_S3_BUCKET, Key=s3_key)
+    buf = io.BytesIO(obj['Body'].read())
+    npz = np.load(buf)
+    return npz['q_ids'], npz['student_ids'], npz['embeddings']
+
+
+def _fetch_similar_details(db, metadata, similar_q_ids):
+    """Fetch question text, student name, and section for a list of q_ids.
+
+    Returns a dict keyed by q_id.
+    """
+    if not similar_q_ids:
+        return {}
+
+    ca_question_submissions        = metadata.tables['ca_question_submissions']
+    college_account_new            = metadata.tables['college_account_new']
+    college_department_section_new = metadata.tables['college_department_section_new']
+    student_section_mapping        = metadata.tables['student_section_mapping']
+
+    section_sub = (
+        select(college_department_section_new.c.section_name)
+        .join(student_section_mapping,
+            student_section_mapping.c.section_id == college_department_section_new.c.id)
+        .where(student_section_mapping.c.student_id == ca_question_submissions.c.student_id)
+        .limit(1)
+        .correlate(ca_question_submissions)
+        .scalar_subquery()
+    )
+
     rows = db.execute(
         select(
-            ca_question_submissions.c.q_id.label('exists_flag'),
-            ca_similar_questions.c.question
+            ca_question_submissions.c.q_id,
+            ca_question_submissions.c.question,
+            college_account_new.c.name.label('student_name'),
+            section_sub.label('section_name'),
         )
-        .select_from(
-            ca_question_submissions
-            .outerjoin(ca_similar_questions,
-                ca_similar_questions.c.source_q_id == ca_question_submissions.c.q_id)
-        )
-        .where(ca_question_submissions.c.q_id == q_id)
+        .join(college_account_new,
+            college_account_new.c.id == ca_question_submissions.c.student_id)
+        .where(ca_question_submissions.c.q_id.in_(similar_q_ids))
     ).mappings().all()
 
-    if not rows:
-        return None  # q_id does not exist
+    return {r['q_id']: dict(r) for r in rows}
 
-    return [r['question'] for r in rows if r['question'] is not None]
+
+def getSimilarQuestions(db, metadata, q_id, n=8):
+    ca_question_submissions = metadata.tables['ca_question_submissions']
+    ca_similar_questions    = metadata.tables['ca_similar_questions']
+    curiosity_assessment    = metadata.tables['curiosity_assessment']
+
+    # Single PK lookup — get source question's ca_id and student_id
+    source = db.execute(
+        select(
+            ca_question_submissions.c.ca_id,
+            ca_question_submissions.c.student_id,
+        ).where(ca_question_submissions.c.q_id == q_id)
+    ).mappings().fetchone()
+
+    if source is None:
+        return None  # q_id does not exist → caller returns 404
+
+    ca_id          = source['ca_id']
+    top_student_id = source['student_id']
+
+    # Check for memoized results — O(log n) indexed lookup, fast path
+    memo_rows = db.execute(
+        select(
+            ca_similar_questions.c.similar_q_id,
+            ca_similar_questions.c.similarity_score,
+        )
+        .where(ca_similar_questions.c.source_q_id == q_id)
+        .order_by(ca_similar_questions.c.similarity_score.desc())
+    ).mappings().all()
+
+    if memo_rows:
+        similar_q_ids = [r['similar_q_id'] for r in memo_rows]
+        details       = _fetch_similar_details(db, metadata, similar_q_ids)
+        scores_map    = {r['similar_q_id']: float(r['similarity_score']) for r in memo_rows}
+        return [
+            {
+                'q_id':         sid,
+                'question':     details[sid]['question'],
+                'student_name': details[sid]['student_name'],
+                'section':      details[sid]['section_name'],
+                'similarity':   scores_map[sid],
+            }
+            for sid in similar_q_ids
+            if sid in details
+        ]
+
+    # Not memoized — load .npz from S3 and compute
+    s3_row = db.execute(
+        select(curiosity_assessment.c.embedding_s3_key)
+        .where(curiosity_assessment.c.assmt_id == ca_id)
+    ).mappings().fetchone()
+
+    if not s3_row or not s3_row['embedding_s3_key']:
+        return []  # assessment not yet ended or embedding build failed
+
+    try:
+        q_ids, student_ids, embeddings = _load_assessment_npz(s3_row['embedding_s3_key'])
+    except Exception as e:
+        log.error("getSimilarQuestions: failed to load .npz for ca_id=%s: %s", ca_id, e)
+        return []
+
+    idx_mask = q_ids == q_id
+    if not idx_mask.any():
+        return []  # top question has no embedding (submitted before feature was enabled)
+
+    query_vec  = embeddings[idx_mask][0]
+    query_norm = query_vec / (np.linalg.norm(query_vec) + 1e-9)
+
+    norms  = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    normed = embeddings / (norms + 1e-9)
+    scores = normed @ query_norm  # (N,)
+
+    # Exclude self and all questions from the same student
+    scores[idx_mask]                      = -np.inf
+    scores[student_ids == top_student_id] = -np.inf
+
+    top_indices = np.argsort(scores)[::-1]
+
+    results = []
+    for idx in top_indices:
+        score = float(scores[idx])
+        if score < _SIMILARITY_MIN or len(results) == n:
+            break
+        results.append({
+            'similar_q_id':     int(q_ids[idx]),
+            'similarity_score': round(score, 4),
+        })
+
+    if not results:
+        return []
+
+    # Persist memoized results — prevents recomputation on every faculty click
+    try:
+        db.execute(
+            ca_similar_questions.insert(),
+            [{'source_q_id': q_id, 'similar_q_id': r['similar_q_id'], 'similarity_score': r['similarity_score']}
+             for r in results],
+        )
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        log.error("getSimilarQuestions: memoization failed for q_id=%s: %s", q_id, e)
+
+    similar_q_ids = [r['similar_q_id'] for r in results]
+    details       = _fetch_similar_details(db, metadata, similar_q_ids)
+    scores_map    = {r['similar_q_id']: r['similarity_score'] for r in results}
+
+    return [
+        {
+            'q_id':         sid,
+            'question':     details[sid]['question'],
+            'student_name': details[sid]['student_name'],
+            'section':      details[sid]['section_name'],
+            'similarity':   scores_map[sid],
+        }
+        for sid in similar_q_ids
+        if sid in details
+    ]
 
 
 def exportAssessment(user_id, db, metadata, assmt_id, fmt, columns):

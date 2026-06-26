@@ -1,5 +1,6 @@
 import json
 import logging
+import numpy as np
 import os
 import time
 from sqlalchemy import select, and_, update, func
@@ -14,6 +15,7 @@ _openai = OpenAI(api_key=os.environ.get('OPENAI_API_KEY'))
 
 _REDIS_SESSION_TTL = 7200   # 2 hours
 
+_EMBED_MODEL     = 'text-embedding-3-small'
 
 def _utcnow():
     return datetime.now(timezone.utc).replace(tzinfo=None)
@@ -253,12 +255,12 @@ def getLiveAssessmentDetailsAndQuestionCards(student_id, ca_id, mode, db, metada
 #   (200, message, data)   on success
 #   (4xx, message, None)   on business-rule failure
 #
-# 3 queries total:
+# 2 queries total:
 #   1. JOIN curiosity_assessment + ca_has_students; scalar subquery for
 #      subject_name (correlated, LIMIT 1 — avoids row multiplication).
-#      Pre-stored aggregates in ca_has_students are used directly.
+#      Pre-stored aggregates and faculty feedback from ca_has_students
+#      are read directly — no separate feedback query needed.
 #   2. ca_question_submissions — all coaching fields unlocked post-submission.
-#   3. ca_faculty_feedback — per-student messages ordered by sent_at.
 #
 # best_score and questions_submitted are derived in Python from query-2 results
 # rather than adding extra DB aggregation.
@@ -267,7 +269,6 @@ def getCuriosityAssessmentEndResults(student_id, ca_id, db, metadata):
     curiosity_assessment    = metadata.tables['curiosity_assessment']
     ca_has_students         = metadata.tables['ca_has_students']
     ca_question_submissions = metadata.tables['ca_question_submissions']
-    ca_faculty_feedback     = metadata.tables['ca_faculty_feedback']
     college_subject_mapping = metadata.tables['college_subject_mapping']
     subject_semester_new    = metadata.tables['subject_semester_new']
     subject_master          = metadata.tables['subject_master']
@@ -304,6 +305,8 @@ def getCuriosityAssessmentEndResults(student_id, ca_id, db, metadata):
             ca_has_students.c.avg_composite_score,
             ca_has_students.c.time_elapsed_seconds,
             ca_has_students.c.submitted_at,
+            ca_has_students.c.faculty_feedback,
+            ca_has_students.c.feedback_sent_at,
             subject_name_sub.label('subject_name')
         )
         .join(ca_has_students, and_(
@@ -342,20 +345,6 @@ def getCuriosityAssessmentEndResults(student_id, ca_id, db, metadata):
             ca_question_submissions.c.student_id == student_id
         ))
         .order_by(ca_question_submissions.c.question_number)
-    ).mappings().all()
-
-    # Query 3: faculty feedback
-    fb_rows = db.execute(
-        select(
-            ca_faculty_feedback.c.feedback_id,
-            ca_faculty_feedback.c.message,
-            ca_faculty_feedback.c.sent_at
-        )
-        .where(and_(
-            ca_faculty_feedback.c.ca_id      == ca_id,
-            ca_faculty_feedback.c.student_id == student_id
-        ))
-        .order_by(ca_faculty_feedback.c.sent_at)
     ).mappings().all()
 
     # Derived from q_rows — no extra DB call
@@ -401,14 +390,10 @@ def getCuriosityAssessmentEndResults(student_id, ca_id, db, metadata):
             }
             for q in q_rows
         ],
-        "faculty_feedback": [
-            {
-                "feedback_id": fb['feedback_id'],
-                "message":     fb['message'],
-                "sent_at":     fb['sent_at'].isoformat() if fb['sent_at'] else None
-            }
-            for fb in fb_rows
-        ]
+        "faculty_feedback": {
+            "message": row['faculty_feedback'],
+            "sent_at": row['feedback_sent_at'].isoformat() if row['feedback_sent_at'] else None
+        } if row['faculty_feedback'] else None
     }
 
     return 200, "Successfully fetched Data", data
@@ -433,6 +418,7 @@ def getEvaluationContext(student_id, ca_id, db, metadata):
             curiosity_assessment.c.status,
             curiosity_assessment.c.source_kind,
             curiosity_assessment.c.vector_store_id,
+            curiosity_assessment.c.vs_status,
             curiosity_assessment.c.question_count,
             ca_has_students.c.status.label('student_status'),
         )
@@ -455,16 +441,20 @@ def getEvaluationContext(student_id, ca_id, db, metadata):
     if not row['vector_store_id']:
         return 503, "Document is still being indexed — please try again shortly", None
 
-    vs_id     = row['vector_store_id']
-    vs_status = redis_client.get("ca_vs_ready:{}".format(vs_id))
-    if vs_status == b'failed':
+    vs_id = row['vector_store_id']
+    if row['vs_status'] == 'failed':
         return 503, "Document indexing failed — please ask your faculty to re-upload the document", None
-    if vs_status != b'1':
-        # Redis key absent: background thread hasn't finished yet, or Redis was
-        # restarted. Do a single live check against OpenAI rather than blocking.
+    if row['vs_status'] != 'ready':
+        # NULL: background thread still running or crashed without updating DB.
+        # Do a single live check against OpenAI and persist the result.
         vs_files = list(_openai.vector_stores.files.list(vs_id))
         if vs_files and all(f.status == 'completed' for f in vs_files):
-            redis_client.set("ca_vs_ready:{}".format(vs_id), "1", ex=86400)
+            db.execute(
+                update(curiosity_assessment)
+                .where(curiosity_assessment.c.assmt_id == ca_id)
+                .values(vs_status='ready')
+            )
+            db.commit()
         else:
             return 503, "Document is still being indexed — please try again shortly", None
     if row['student_status'] == 'submitted':
@@ -522,6 +512,15 @@ def saveQuestionEvaluation(student_id, ca_id, question_text, question_number, ev
     now    = _utcnow()
     t_save = time.perf_counter()
 
+    # Student already received their result via SSE stream before this runs,
+    # so embedding latency (~150ms) has zero impact on student experience.
+    embedding_bytes = None
+    try:
+        response        = _openai.embeddings.create(model=_EMBED_MODEL, input=question_text)
+        embedding_bytes = np.array(response.data[0].embedding, dtype=np.float32).tobytes()
+    except Exception as e:
+        log.error("saveQuestionEvaluation embedding failed: %s", e)
+
     try:
         db.execute(
             ca_question_submissions.insert().values(
@@ -538,6 +537,7 @@ def saveQuestionEvaluation(student_id, ca_id, question_text, question_number, ev
                 question_reframe = eval_result.get("reframed_question") or None,
                 nudge            = None,
                 submitted_at     = now,
+                embedding        = embedding_bytes,
             )
         )
 
