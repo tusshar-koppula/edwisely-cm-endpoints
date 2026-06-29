@@ -48,6 +48,7 @@ logs/
 *.zip
 
 #Misc
+app_socket.py
 Complete_Endpoint_List.txt
 Comprehensive faculty design_Curiosity Assessment Included.html
 Student_Web_Profile.html

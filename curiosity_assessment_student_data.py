@@ -17,6 +17,26 @@ _REDIS_SESSION_TTL = 7200   # 2 hours
 
 _EMBED_MODEL     = 'text-embedding-3-small'
 
+
+def _publish_live_event(ca_id, payload):
+    try:
+        redis_client.publish(
+            "app:curiosity:live:assessment:{}".format(ca_id),
+            json.dumps(payload),
+        )
+    except Exception as exc:
+        log.warning("Live event publish failed (non-fatal): %s", exc)
+
+
+def _get_student_name(student_id, db, metadata):
+    college_account_new = metadata.tables['college_account_new']
+    row = db.execute(
+        select(college_account_new.c.name)
+        .where(college_account_new.c.id == student_id)
+    ).mappings().fetchone()
+    return row['name'] if row else ""
+
+
 def _utcnow():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -191,6 +211,12 @@ def getLiveAssessmentDetailsAndQuestionCards(student_id, ca_id, mode, db, metada
         )
         db.commit()
         started_at = now
+        _publish_live_event(ca_id, {
+            "event":        "started_writing",
+            "student_id":   student_id,
+            "student_name": _get_student_name(student_id, db, metadata),
+            "timestamp":    now.isoformat(),
+        })
     else:
         started_at = row['started_at']
 
@@ -522,7 +548,7 @@ def saveQuestionEvaluation(student_id, ca_id, question_text, question_number, ev
         log.error("saveQuestionEvaluation embedding failed: %s", e)
 
     try:
-        db.execute(
+        ins_result = db.execute(
             ca_question_submissions.insert().values(
                 ca_id            = ca_id,
                 student_id       = student_id,
@@ -540,6 +566,7 @@ def saveQuestionEvaluation(student_id, ca_id, question_text, question_number, ev
                 embedding        = embedding_bytes,
             )
         )
+        q_id = ins_result.lastrowid
 
         # Recompute per-student averages over all questions including the one just inserted.
         # The session autoflushes the INSERT before this SELECT executes.
@@ -574,6 +601,35 @@ def saveQuestionEvaluation(student_id, ca_id, question_text, question_number, ev
     except Exception:
         db.rollback()
         raise
+
+    student_name = _get_student_name(student_id, db, metadata)
+    ts           = _utcnow().isoformat()
+    new_avg      = float(avg_row['avg_composite']) if avg_row['avg_composite'] is not None else None
+
+    base = {
+        "student_id":      student_id,
+        "student_name":    student_name,
+        "timestamp":       ts,
+        "question_id":     q_id,
+        "question_number": question_number,
+        "question":        question_text,
+    }
+
+    is_leading = False
+    if new_avg is not None:
+        rival      = db.execute(
+            select(func.max(ca_has_students.c.avg_composite_score).label('max_score'))
+            .where(and_(
+                ca_has_students.c.ca_id      == ca_id,
+                ca_has_students.c.student_id != student_id,
+            ))
+        ).mappings().fetchone()
+        rival_max  = float(rival['max_score']) if rival and rival['max_score'] is not None else None
+        is_leading = rival_max is None or new_avg > rival_max
+
+    _publish_live_event(ca_id, {"event": "submitted_question", **base})
+    if is_leading:
+        _publish_live_event(ca_id, {"event": "submitted_question_leading", **base, "score": round(new_avg, 2)})
 
     # Mutate session state and write to Redis after commit — keeps them in sync;
     # a DB failure leaves Redis at the prior clean state rather than ahead of it
@@ -666,5 +722,22 @@ def endCuriosityAssessment(student_id, ca_id, trigger, now, db, metadata):
         return 500, "Failed to end assessment — please try again"
 
     db.commit()
+    ca_question_submissions = metadata.tables['ca_question_submissions']
+    last_q = db.execute(
+        select(ca_question_submissions.c.question)
+        .where(and_(
+            ca_question_submissions.c.ca_id      == ca_id,
+            ca_question_submissions.c.student_id == student_id,
+        ))
+        .order_by(ca_question_submissions.c.question_number.desc())
+        .limit(1)
+    ).mappings().fetchone()
+    _publish_live_event(ca_id, {
+        "event":        "submitted_assessment",
+        "student_id":   student_id,
+        "student_name": _get_student_name(student_id, db, metadata),
+        "timestamp":    now.isoformat(),
+        "question":     last_q['question'] if last_q else None,
+    })
     redis_client.delete(_redis_session_key(ca_id, student_id))
     return 200, "Assessment ended successfully"
