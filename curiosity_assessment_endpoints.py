@@ -151,6 +151,13 @@ def createOrUpdateAssessment(user):
         db          = get_db()
         doc_info = None
         if request.files.get('file'):
+            upload = request.files.get('file')
+            upload.seek(0, os.SEEK_END)
+            file_size = upload.tell()
+            upload.seek(0)
+            if file_size > 50 * 1024 * 1024:
+                return jsonify({"status": 422, "message": "Document exceeds the 50MB size limit"})
+
             assmt_id_for_upload = request.form.get('assessment_id')
             assmt_id_for_upload = int(assmt_id_for_upload) if assmt_id_for_upload and assmt_id_for_upload.isdigit() else None
             doc_info = curiosity_assessment_data.uploadDocument(user_id, db, metadata, request.files.get('file'), assmt_id=assmt_id_for_upload)
@@ -181,6 +188,14 @@ def createOrUpdateAssessment(user):
         topic_ids  = json.loads(topic_ids_raw)  if topic_ids_raw  else None
         recipients = json.loads(recipients_raw) if recipients_raw else None
         rubric     = json.loads(rubric_raw)     if rubric_raw     else None
+
+        if rubric is not None:
+            try:
+                rubric_sum = rubric['relevance'] + rubric['blooms'] + rubric['depth']
+            except (KeyError, TypeError):
+                return jsonify({"status": 422, "message": "rubric must contain numeric 'relevance', 'blooms', and 'depth' values"})
+            if rubric_sum != 10:
+                return jsonify({"status": 422, "message": "rubric values (relevance, blooms, depth) must sum to 10"})
 
         if status in ('live', 'scheduled'):
             missing = []
@@ -252,6 +267,14 @@ def createOrUpdateAssessment(user):
         topic_ids  = json.loads(topic_ids_raw)  if topic_ids_raw  else None
         recipients = json.loads(recipients_raw) if recipients_raw else None
         rubric     = json.loads(rubric_raw)     if rubric_raw     else None
+
+        if rubric is not None:
+            try:
+                rubric_sum = rubric['relevance'] + rubric['blooms'] + rubric['depth']
+            except (KeyError, TypeError):
+                return jsonify({"status": 422, "message": "rubric must contain numeric 'relevance', 'blooms', and 'depth' values"})
+            if rubric_sum != 10:
+                return jsonify({"status": 422, "message": "rubric values (relevance, blooms, depth) must sum to 10"})
 
         try:
             question_count   = int(question_count)   if question_count   else None

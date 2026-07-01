@@ -16,6 +16,7 @@ _openai = OpenAI(api_key=os.environ.get('OPENAI_API_KEY'))
 _REDIS_SESSION_TTL = 7200   # 2 hours
 
 _EMBED_MODEL     = 'text-embedding-3-small'
+_EMBED_PRICE_PER_1M = 0.02  # text-embedding-3-small: $0.02 input per 1M tokens
 
 
 def _publish_live_event(ca_id, payload):
@@ -544,6 +545,16 @@ def saveQuestionEvaluation(student_id, ca_id, question_text, question_number, ev
     try:
         response        = _openai.embeddings.create(model=_EMBED_MODEL, input=question_text)
         embedding_bytes = np.array(response.data[0].embedding, dtype=np.float32).tobytes()
+        _emb_usage      = getattr(response, "usage", None)
+        if _emb_usage:
+            _emb_prompt = getattr(_emb_usage, "prompt_tokens", 0) or 0
+            _emb_cost   = _emb_prompt * _EMBED_PRICE_PER_1M / 1_000_000
+            log.info(
+                "USAGE | embedding | prompt=%s total=%s | cost=$%.6f",
+                _emb_prompt,
+                getattr(_emb_usage, "total_tokens", 0),
+                _emb_cost,
+            )
     except Exception as e:
         log.error("saveQuestionEvaluation embedding failed: %s", e)
 

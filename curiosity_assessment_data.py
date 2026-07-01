@@ -1118,11 +1118,13 @@ def _ingest_to_vector_store(vector_store_id, file_bytes, filename):
 
 
 def uploadDocument(user_id, db, metadata, file, assmt_id=None):
+    t_start = time.perf_counter()
     filename   = file.filename
     file_bytes = file.read()
     size_bytes = len(file_bytes)
 
     pages  = len(PdfReader(io.BytesIO(file_bytes)).pages)
+    t_after_read = time.perf_counter()
     # assmt_id is the stable unique identifier per document (1 doc per assessment).
     # Falls back to UUID only on initial creation (POST) when assmt_id is not yet known.
     identifier = assmt_id if assmt_id else uuid.uuid4().hex
@@ -1134,6 +1136,7 @@ def uploadDocument(user_id, db, metadata, file, assmt_id=None):
         s3_key,
         ExtraArgs={'ContentType': 'application/pdf'}
     )
+    t_after_s3 = time.perf_counter()
     storage_url = 'https://{}.s3.{}.amazonaws.com/{}'.format(
         _S3_BUCKET, os.environ.get('AWS_REGION'), s3_key
     )
@@ -1144,6 +1147,12 @@ def uploadDocument(user_id, db, metadata, file, assmt_id=None):
         expires_after={'anchor': 'last_active_at', 'days': 365},
     )
     vector_store_id = vs.id
+    t_after_vs = time.perf_counter()
+
+    log.info(
+        "TIMING uploadDocument | read+parse=%.3fs s3_upload=%.3fs vs_create=%.3fs total=%.3fs",
+        t_after_read - t_start, t_after_s3 - t_after_read, t_after_vs - t_after_s3, t_after_vs - t_start,
+    )
 
     log.info(
         "Vector store indexing started | vector_store_id=%s filename=%s size_bytes=%d",

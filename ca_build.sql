@@ -91,7 +91,6 @@ CREATE TABLE IF NOT EXISTS ca_has_topics (
 
     CONSTRAINT fk_caht_ca
         FOREIGN KEY (ca_id) REFERENCES curiosity_assessment (assmt_id)
-        ON DELETE CASCADE
 
 ) ENGINE=InnoDB;
 
@@ -110,7 +109,6 @@ CREATE TABLE IF NOT EXISTS ca_has_sections (
 
     CONSTRAINT fk_cahs_ca
         FOREIGN KEY (ca_id) REFERENCES curiosity_assessment (assmt_id)
-        ON DELETE CASCADE
 
 ) ENGINE=InnoDB;
 
@@ -142,7 +140,6 @@ CREATE TABLE IF NOT EXISTS ca_has_students (
 
     CONSTRAINT fk_cahst_ca
         FOREIGN KEY (ca_id) REFERENCES curiosity_assessment (assmt_id)
-        ON DELETE CASCADE
 
 ) ENGINE=InnoDB;
 
@@ -181,7 +178,6 @@ CREATE TABLE IF NOT EXISTS ca_question_submissions (
 
     CONSTRAINT fk_cqs_ca
         FOREIGN KEY (ca_id) REFERENCES curiosity_assessment (assmt_id)
-        ON DELETE CASCADE
 
 ) ENGINE=InnoDB;
 
@@ -205,7 +201,6 @@ CREATE TABLE IF NOT EXISTS ca_share (
 
     CONSTRAINT fk_cas_ca
         FOREIGN KEY (ca_id) REFERENCES curiosity_assessment (assmt_id)
-        ON DELETE CASCADE
 
 ) ENGINE=InnoDB;
 
@@ -215,8 +210,8 @@ CREATE TABLE IF NOT EXISTS ca_share (
 --    Memoized cosine-similarity pairs computed at result
 --    time.  No FK to ca_question_submissions intentionally:
 --    cascade deletes via the parent assessment are handled
---    by the application layer (submissions are cascade-
---    deleted → these rows become stale but harmless).
+--    by the application layer if the parent assessment and its
+--    submissions are ever deleted.
 -- -------------------------------------------------------
 CREATE TABLE IF NOT EXISTS ca_similar_questions (
     id               INT          NOT NULL AUTO_INCREMENT,

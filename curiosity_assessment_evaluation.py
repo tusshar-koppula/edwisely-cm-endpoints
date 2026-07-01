@@ -63,6 +63,61 @@ def _parse_json_payload(raw: str) -> dict[str, Any]:
         return json.loads(raw[start: end + 1])
 
 
+# Pricing per 1M tokens: (uncached_input, cached_input, output).
+# Source: user-confirmed OpenAI rates (short context <272K). Keep in sync.
+_MODEL_PRICING: dict[str, tuple[float, float, float]] = {
+    "gpt-5.4-mini": (0.75, 0.075, 4.50),
+    "gpt-5.4-nano": (0.20, 0.02,  1.25),
+}
+
+# File search billed per tool call: $2.50 / 1k calls. Counted by the number of
+# file_search_call items the model actually emits in a response, not per question.
+_FILE_SEARCH_CALL_PRICE = 2.50 / 1000
+
+
+def _usage_cost(model: str, input_tokens: int, cached_tokens: int, output_tokens: int) -> float:
+    """Dollar cost of one call. Cached input is billed at the cheaper cached rate."""
+    rates = _MODEL_PRICING.get(model)
+    if not rates:
+        return 0.0
+    in_rate, cached_rate, out_rate = rates
+    uncached = max(input_tokens - cached_tokens, 0)
+    return (uncached * in_rate + cached_tokens * cached_rate + output_tokens * out_rate) / 1_000_000
+
+
+def _log_usage(tag: str, model: str, response: Any) -> float:
+    """Log token usage + dollar cost for one Responses API call; return the cost.
+
+    cached_tokens reveals prompt-cache hit rate; reasoning_tokens reveals how much
+    of the (output-priced) generation was internal reasoning vs. visible output.
+    """
+    try:
+        usage = getattr(response, "usage", None)
+        if not usage:
+            return 0.0
+        in_details  = getattr(usage, "input_tokens_details", None)
+        out_details = getattr(usage, "output_tokens_details", None)
+        input_tokens  = getattr(usage, "input_tokens", 0) or 0
+        output_tokens = getattr(usage, "output_tokens", 0) or 0
+        cached    = (getattr(in_details, "cached_tokens", 0) if in_details else 0) or 0
+        reasoning = (getattr(out_details, "reasoning_tokens", 0) if out_details else 0) or 0
+        cost = _usage_cost(model, input_tokens, cached, output_tokens)
+        log.info(
+            "USAGE | %s | input=%s (cached=%s) output=%s (reasoning=%s) total=%s | cost=$%.6f",
+            tag,
+            input_tokens,
+            cached,
+            output_tokens,
+            reasoning,
+            getattr(usage, "total_tokens", 0) or 0,
+            cost,
+        )
+        return cost
+    except Exception as exc:
+        log.warning("USAGE | %s | failed to read usage: %s", tag, exc)
+        return 0.0
+
+
 # ─────────────────────────────────────────────────────────────
 # System prompts
 # ─────────────────────────────────────────────────────────────
@@ -249,7 +304,7 @@ Use these steps as your internal reasoning framework. Work through them in seque
   -> If NO: Case 1 (paste). Hard stop — emit JSON now.
   -> If YES: strip question words, auxiliary verbs, and punctuation
      from the question and check the remaining claim against the
-     passage chunks.
+     synthesized passage.
   -> BEFORE checking the passage: confirm the stripped remainder
      contains a predicate (subject + verb + complement). If only a
      noun or noun phrase remains, the passage-match test does not
@@ -612,6 +667,46 @@ _REFRAME_FALLBACK: dict[str, Any] = {
 
 
 # ─────────────────────────────────────────────────────────────
+# Verbatim-paste pre-check (Python) — short-circuits near-verbatim/disguised
+# pastes before the gate LLM call. Calibrated via shadow-mode measurement
+# against 10 real submissions: partial_ratio >= 96 had zero false positives
+# on genuine questions (max observed 95.8) and caught every verbatim/
+# near-verbatim paste (min observed 97.9). Declarative non-questions and
+# semantically-paraphrased pastes score low here by design (they aren't
+# lexical-overlap problems) and are still caught by the gate via synthesis.
+# ─────────────────────────────────────────────────────────────
+from rapidfuzz import fuzz, utils as _fuzz_utils
+
+_PASTE_PARTIAL_RATIO_THRESHOLD = 96.0
+
+
+def _is_verbatim_paste(question: str, chunks: list[str]) -> bool:
+    """True if `question` near-verbatim-matches any retrieved chunk.
+
+    rapidfuzz.fuzz.partial_ratio is C++/SIMD-backed; `processor=default_process`
+    lowercases/strips punctuation once per string with no Python-level looping.
+    Short-circuits (skips scoring remaining chunks) as soon as one chunk clears
+    the threshold — the decision is already final at that point.
+    """
+    best_idx, best_score = -1, -1.0
+    for i, chunk in enumerate(chunks):
+        score = fuzz.partial_ratio(question, chunk, processor=_fuzz_utils.default_process)
+        if score > best_score:
+            best_idx, best_score = i, score
+        if score >= _PASTE_PARTIAL_RATIO_THRESHOLD:
+            log.info(
+                "PASTE-CHECK | chunk=%d partial_ratio=%.1f >= %.1f | verdict=paste",
+                i, score, _PASTE_PARTIAL_RATIO_THRESHOLD,
+            )
+            return True
+    log.info(
+        "PASTE-CHECK | best_chunk=%d best_partial_ratio=%.1f < %.1f | verdict=not_paste",
+        best_idx, best_score, _PASTE_PARTIAL_RATIO_THRESHOLD,
+    )
+    return False
+
+
+# ─────────────────────────────────────────────────────────────
 # Chunk retrieval via OpenAI file_search (Responses API)
 # ─────────────────────────────────────────────────────────────
 def retrieve_chunks(
@@ -625,6 +720,7 @@ def retrieve_chunks(
             model=RETRIEVAL_MODEL,
             instructions=SYNTHESIS_SYSTEM_PROMPT,
             input=query,
+            prompt_cache_key="ca-retrieval",
             tools=[
                 {
                     "type": "file_search",
@@ -634,13 +730,18 @@ def retrieve_chunks(
             ],
             include=["file_search_call.results"],
         )
+        _retrieval_cost = _log_usage("retrieval", RETRIEVAL_MODEL, response)
         chunks: list[str] = []
+        fs_calls = 0
         for item in (response.output or []):
             if getattr(item, "type", "") == "file_search_call":
+                fs_calls += 1
                 for result in (getattr(item, "results", None) or []):
                     text = getattr(result, "text", None)
                     if text:
                         chunks.append(text)
+        _fs_cost = fs_calls * _FILE_SEARCH_CALL_PRICE
+        log.info("USAGE | file_search | calls=%d | cost=$%.6f", fs_calls, _fs_cost)
         chunks = [_strip_chunk_metadata(c) for c in chunks[:max_results] if c]
         synthesis = _extract_response_text(response).strip()
         if not synthesis and chunks:
@@ -649,7 +750,7 @@ def retrieve_chunks(
             "File Search retrieved %d chunks | synthesis_len=%d",
             len(chunks), len(synthesis),
         )
-        return {"chunks": chunks, "synthesis": synthesis}
+        return {"chunks": chunks, "synthesis": synthesis, "_cost": _retrieval_cost, "_fs_cost": _fs_cost}
     except Exception as exc:
         error_str = str(exc)
         if "not found" in error_str.lower() or "404" in error_str:
@@ -659,7 +760,7 @@ def retrieve_chunks(
             )
         else:
             log.error("File Search retrieval failed: %s", exc)
-        return {"chunks": [], "synthesis": ""}
+        return {"chunks": [], "synthesis": "", "_cost": 0.0, "_fs_cost": 0.0}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -671,7 +772,13 @@ def _call_gate(
     synthesis: str,
     previous_questions: list[dict],
 ) -> dict[str, Any]:
-    context_str = "\n".join(f"{i+1}. {c}" for i, c in enumerate(chunks))
+    # Raw chunk text is no longer sent here — near-verbatim/disguised pastes
+    # (Case 1's passage-match test) are pre-filtered in Python by
+    # _is_verbatim_paste before this call runs. The gate now only needs to
+    # judge from the synthesis: "no genuine question at all" (Case 1's other
+    # branch), cases 2/4/5/6/7, and semantically-paraphrased pastes that
+    # lexical overlap can't catch (still requires the LLM's judgment).
+    # `chunks` is retained solely to detect a failed/empty retrieval below.
     prev_q_str = (
         "\n".join(f"- {q.get('text', '')}" for q in previous_questions if q.get("text"))
         if previous_questions else "None"
@@ -683,21 +790,23 @@ def _call_gate(
     )
     user_msg = (
         f"STUDENT QUESTION: {question}\n\n"
-        f"RAW CHUNKS (use only for verbatim paste detection — Case 1):\n{context_str or '(none)'}\n\n"
-        f"SYNTHESIZED PASSAGE (use for off-topic check and all other reasoning — Cases 2–7):\n{synthesis or '(none)'}\n"
+        f"SYNTHESIZED PASSAGE (use for all reasoning — Cases 1–7):\n{synthesis or '(none)'}\n"
         f"{no_chunks_notice}\n"
         f"PREVIOUS QUESTIONS THIS SESSION:\n{prev_q_str}"
     )
     raw = ""
+    _gate_cost_total = 0.0
     for attempt in range(2):
         try:
             response = _openai.responses.create(
                 model=GATE_MODEL,
                 instructions=GATE_SYSTEM_PROMPT,
                 input=user_msg + "\n\nRespond with a JSON object.",
+                prompt_cache_key="ca-gate",
                 reasoning={"effort": "medium"},
                 text={"format": {"type": "json_object"}},
             )
+            _gate_cost_total += _log_usage("gate", GATE_MODEL, response)
             raw = _extract_response_text(response)
             result = _parse_json_payload(raw)
             log.info(
@@ -706,12 +815,24 @@ def _call_gate(
                 result.get("anchor_list"),
                 result.get("passage_links"),
             )
+            result["_cost"] = _gate_cost_total
+            if attempt > 0:
+                log.info(
+                    "COST-RETRY | gate | attempts=%d total_cost=$%.6f (incl. %d failed attempt(s))",
+                    attempt + 1, _gate_cost_total, attempt,
+                )
             return result
         except Exception as exc:
             log.warning("Gate call attempt %d failed: %s", attempt + 1, exc)
             if attempt == 1:
-                log.error("Gate fallback. Raw: %s", raw)
-    return {"flag": "pass", "premise": ["gate-failure"], "valid_question": question, "stop_reason": None, "note": None}
+                log.error(
+                    "Gate fallback after %d attempts | cost_incurred=$%.6f | Raw: %s",
+                    attempt + 1, _gate_cost_total, raw,
+                )
+    return {
+        "flag": "pass", "premise": ["gate-failure"], "valid_question": question,
+        "stop_reason": None, "note": None, "_cost": _gate_cost_total,
+    }
 
 
 # ─────────────────────────────────────────────────────────────
@@ -798,15 +919,18 @@ def _call_scoring(
         previous_scaffold_parameters=previous_scaffold_parameters,
     )
     raw = ""
+    _scoring_cost_total = 0.0
     for attempt in range(2):
         try:
             response = _openai.responses.create(
                 model=EVALUATOR_MODEL,
                 instructions=SCORING_SYSTEM_PROMPT,
                 input=user_msg + "\n\nRespond with a JSON object.",
+                prompt_cache_key="ca-scoring",
                 text={"format": {"type": "json_object"}},
                 reasoning={"effort": "medium"},
             )
+            _scoring_cost_total += _log_usage("scoring", EVALUATOR_MODEL, response)
             raw = _extract_response_text(response)
             parsed = _parse_json_payload(raw)
             scores = parsed.get("scores")
@@ -815,11 +939,21 @@ def _call_scoring(
             for _key in ("relevance_r", "bloom_b", "depth_d"):
                 if scores.get(_key) is None:
                     raise ValueError(f"'{_key}' missing from scores in model response")
+            parsed["_cost"] = _scoring_cost_total
+            if attempt > 0:
+                log.info(
+                    "COST-RETRY | scoring | attempts=%d total_cost=$%.6f (incl. %d failed attempt(s))",
+                    attempt + 1, _scoring_cost_total, attempt,
+                )
             return parsed
         except Exception as exc:
             log.warning("Scoring call attempt %d failed: %s", attempt + 1, exc)
             if attempt == 1:
-                log.error("Scoring fallback. Raw: %s", raw)
+                log.error(
+                    "Scoring fallback after %d attempts | cost_incurred=$%.6f (this cost is NOT "
+                    "reflected in the submission's COST roll-up — caller receives None) | Raw: %s",
+                    attempt + 1, _scoring_cost_total, raw,
+                )
     return None
 
 
@@ -955,23 +1089,37 @@ def _call_feedback(
         f"  depth_reasoning: {cot.get('depth_reasoning', '')}"
     )
     raw = ""
+    _feedback_cost_total = 0.0
     for attempt in range(2):
         try:
             response = _openai.responses.create(
                 model=FEEDBACK_MODEL,
                 instructions=FEEDBACK_SYSTEM_PROMPT,
                 input=user_msg + "\n\nRespond with a JSON object.",
+                prompt_cache_key="ca-feedback",
                 text={"format": {"type": "json_object"}},
                 reasoning={"effort": "low"},
             )
+            _feedback_cost_total += _log_usage("feedback", FEEDBACK_MODEL, response)
             raw = _extract_response_text(response)
             parsed = _parse_json_payload(raw)
+            parsed["_cost"] = _feedback_cost_total
+            if attempt > 0:
+                log.info(
+                    "COST-RETRY | feedback | attempts=%d total_cost=$%.6f (incl. %d failed attempt(s))",
+                    attempt + 1, _feedback_cost_total, attempt,
+                )
             return parsed
         except Exception as exc:
             log.warning("Feedback call attempt %d failed: %s", attempt + 1, exc)
             if attempt == 1:
-                log.error("Feedback fallback. Raw: %s", raw)
-    return _FEEDBACK_FALLBACK.copy()
+                log.error(
+                    "Feedback fallback after %d attempts | cost_incurred=$%.6f | Raw: %s",
+                    attempt + 1, _feedback_cost_total, raw,
+                )
+    _fb = _FEEDBACK_FALLBACK.copy()
+    _fb["_cost"] = _feedback_cost_total
+    return _fb
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1002,15 +1150,18 @@ def _call_reframe(
         f"depth_d: {int(scores.get('depth_d', 0))}"
     )
     raw = ""
+    _reframe_cost_total = 0.0
     for attempt in range(2):
         try:
             response = _openai.responses.create(
                 model=REFRAME_MODEL,
                 instructions=REFRAME_SYSTEM_PROMPT,
                 input=user_msg + "\n\nRespond with a JSON object.",
+                prompt_cache_key="ca-reframe",
                 text={"format": {"type": "json_object"}},
                 reasoning={"effort": "medium"},
             )
+            _reframe_cost_total += _log_usage("reframe", REFRAME_MODEL, response)
             raw = _extract_response_text(response)
             parsed = _parse_json_payload(raw)
             reframed = parsed.get("reframed_question", "")
@@ -1029,12 +1180,23 @@ def _call_reframe(
             if not isinstance(depth_target, int) or depth_target <= int(scores.get("depth_d", 0)):
                 log.warning("Reframe call returned invalid depth_target=%s (attempt %d).", depth_target, attempt + 1)
                 continue
+            parsed["_cost"] = _reframe_cost_total
+            if attempt > 0:
+                log.info(
+                    "COST-RETRY | reframe | attempts=%d total_cost=$%.6f (incl. %d failed attempt(s))",
+                    attempt + 1, _reframe_cost_total, attempt,
+                )
             return parsed
         except Exception as exc:
             log.warning("Reframe call attempt %d failed: %s", attempt + 1, exc)
             if attempt == 1:
-                log.error("Reframe fallback. Raw: %s", raw)
-    return _REFRAME_FALLBACK.copy()
+                log.error(
+                    "Reframe fallback after %d attempts | cost_incurred=$%.6f | Raw: %s",
+                    attempt + 1, _reframe_cost_total, raw,
+                )
+    _rf = _REFRAME_FALLBACK.copy()
+    _rf["_cost"] = _reframe_cost_total
+    return _rf
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1138,6 +1300,35 @@ def call_evaluator_streaming(
     if not chunks:
         log.warning("RETRIEVAL: 0 chunks for vector_store_id=%s", vector_store_id)
 
+    _ZERO_SCORES = {"relevance_r": 0.0, "bloom_b": 0, "depth_d": 0, "bridging_bonus": 0, "composite_score": 0.0}
+
+    def _gate_stop(current_topic, scores, verdict_tone, verdict, feedback, diagnosis):
+        return {
+            "stage":            "complete",
+            "skip_history":     True,
+            "current_topic":    current_topic,
+            "scores":           scores,
+            "verdictTone":      verdict_tone,
+            "verdict":          verdict,
+            "feedback":         feedback,
+            "diagnosis":        diagnosis,
+            "scaffold_assigned": {"strategy": "premise_correction", "parameters": []},
+            "reframed_question":   None,
+            "student_must_decide": None,
+            "suppress_tier":       False,
+            "topics":              [],
+        }
+
+    # Verbatim-paste pre-check — runs before the (expensive) gate LLM call.
+    # On a hit, skips gate + scoring + feedback + reframe entirely.
+    if chunks and _is_verbatim_paste(student_question, chunks):
+        yield _gate_stop(
+            "Off-Topic", _ZERO_SCORES, "bad", "Not a question.",
+            "What was submitted isn't a question — it looks like a passage from the material. Try forming a question about something in it that you found interesting or unclear.",
+            "This submission is prose, not a question — it can't be scored.",
+        )
+        return
+
     previous_questions = session_state.get("previous_questions", [])
     t0 = time.perf_counter()
     gate_result = _call_gate(
@@ -1157,25 +1348,6 @@ def call_evaluator_streaming(
     _gate_premise = (gate_result.get("premise") or [])
     _premise_lead = _gate_premise[0] if _gate_premise else ""
     stop_reason   = gate_result.get("stop_reason")
-
-    _ZERO_SCORES = {"relevance_r": 0.0, "bloom_b": 0, "depth_d": 0, "bridging_bonus": 0, "composite_score": 0.0}
-
-    def _gate_stop(current_topic, scores, verdict_tone, verdict, feedback, diagnosis):
-        return {
-            "stage":            "complete",
-            "skip_history":     True,
-            "current_topic":    current_topic,
-            "scores":           scores,
-            "verdictTone":      verdict_tone,
-            "verdict":          verdict,
-            "feedback":         feedback,
-            "diagnosis":        diagnosis,
-            "scaffold_assigned": {"strategy": "premise_correction", "parameters": []},
-            "reframed_question":   None,
-            "student_must_decide": None,
-            "suppress_tier":       False,
-            "topics":              [],
-        }
 
     if _premise_lead == "off-topic" or stop_reason in ("off_topic", "question is off-topic"):
         yield _gate_stop(
@@ -1345,6 +1517,20 @@ def call_evaluator_streaming(
         float(scores.get("composite_score", 0)),
         "yes" if reframed_question else "no",
         time.perf_counter() - t_start,
+    )
+
+    # Per-submission cost roll-up — sums the dollar cost of all model calls in this
+    # submission (embedding cost is logged separately in the save path). Excludes
+    # gate-stop short-circuits, which return before scoring/feedback/reframe run.
+    _r_cost  = retrieval.get("_cost", 0.0)
+    _g_cost  = gate_result.get("_cost", 0.0)
+    _s_cost  = scoring_result.get("_cost", 0.0)
+    _f_cost  = feedback_result.get("_cost", 0.0)
+    _rf_cost = reframe_result.get("_cost", 0.0)
+    log.info(
+        "COST | submission | retrieval=$%.6f gate=$%.6f scoring=$%.6f feedback=$%.6f reframe=$%.6f | TOTAL=$%.6f",
+        _r_cost, _g_cost, _s_cost, _f_cost, _rf_cost,
+        _r_cost + _g_cost + _s_cost + _f_cost + _rf_cost,
     )
 
     # Coaching data accumulated by endpoint for DB save — not forwarded to client
